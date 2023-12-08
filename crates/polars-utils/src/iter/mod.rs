@@ -1,4 +1,6 @@
 mod enumerate_idx;
+pub mod nested;
+
 pub use enumerate_idx::EnumerateIdxTrait;
 
 pub trait IntoIteratorCopied: IntoIterator {

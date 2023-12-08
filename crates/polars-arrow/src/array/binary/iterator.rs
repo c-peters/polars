@@ -1,5 +1,7 @@
+use polars_utils::iter::nested::FromNestedIterator;
+
 use super::{BinaryArray, MutableBinaryValuesArray};
-use crate::array::{ArrayAccessor, ArrayValuesIter};
+use crate::array::{ArrayAccessor, ArrayValuesIter, MutableBinaryArray};
 use crate::bitmap::utils::{BitmapIter, ZipValidity};
 use crate::offset::Offset;
 
@@ -38,5 +40,21 @@ impl<'a, O: Offset> IntoIterator for &'a MutableBinaryValuesArray<O> {
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
+    }
+}
+
+impl<'a> FromNestedIterator<Option<&'a [u8]>> for BinaryArray<i64> {
+    fn _from_iter_nested<
+        I: IntoIterator<Item = J> + Clone,
+        J: IntoIterator<Item = Option<&'a [u8]>>,
+    >(
+        iter: I,
+        capacity: usize,
+    ) -> Self {
+        let mut arr = MutableBinaryArray::with_capacity(capacity);
+        for inner_iter in iter.into_iter() {
+            arr.extend(inner_iter)
+        }
+        arr.into()
     }
 }

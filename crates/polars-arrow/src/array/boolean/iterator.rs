@@ -1,3 +1,5 @@
+use polars_utils::iter::nested::FromNestedIterator;
+
 use super::super::MutableArray;
 use super::{BooleanArray, MutableBooleanArray};
 use crate::array::ArrayAccessor;
@@ -66,5 +68,21 @@ unsafe impl<'a> ArrayAccessor<'a> for BooleanArray {
     #[inline]
     fn len(&self) -> usize {
         (*self).len()
+    }
+}
+
+impl FromNestedIterator<Option<bool>> for BooleanArray {
+    fn _from_iter_nested<
+        I: IntoIterator<Item = J> + Clone,
+        J: IntoIterator<Item = Option<bool>>,
+    >(
+        iter: I,
+        capacity: usize,
+    ) -> Self {
+        let mut arr = MutableBooleanArray::with_capacity(capacity);
+        for inner_iter in iter.into_iter() {
+            arr.extend(inner_iter)
+        }
+        arr.into()
     }
 }

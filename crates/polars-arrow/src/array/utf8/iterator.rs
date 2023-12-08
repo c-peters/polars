@@ -1,3 +1,5 @@
+use polars_utils::iter::nested::FromNestedIterator;
+
 use super::{MutableUtf8Array, MutableUtf8ValuesArray, Utf8Array};
 use crate::array::{ArrayAccessor, ArrayValuesIter};
 use crate::bitmap::utils::{BitmapIter, ZipValidity};
@@ -75,5 +77,21 @@ impl<'a, O: Offset> IntoIterator for &'a MutableUtf8ValuesArray<O> {
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
+    }
+}
+
+impl<'a> FromNestedIterator<Option<&'a str>> for Utf8Array<i64> {
+    fn _from_iter_nested<
+        I: IntoIterator<Item = J> + Clone,
+        J: IntoIterator<Item = Option<&'a str>>,
+    >(
+        iter: I,
+        capacity: usize,
+    ) -> Self {
+        let mut arr = MutableUtf8Array::with_capacity(capacity);
+        for inner_iter in iter.into_iter() {
+            arr.extend(inner_iter)
+        }
+        arr.into()
     }
 }
