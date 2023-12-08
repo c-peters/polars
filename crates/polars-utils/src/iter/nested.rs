@@ -1,32 +1,12 @@
 pub trait FromNestedIterator<A>: Sized {
-    fn from_iter_nested<I: IntoIterator<Item = J> + Clone, J: IntoIterator<Item = A>>(
-        iter: I,
-        length: Option<usize>,
-    ) -> Self {
-        let capacity = <Self as FromNestedIterator<A>>::_get_capacity(&iter, length);
-        FromNestedIterator::_from_iter_nested(iter, capacity)
-    }
-
-    fn _get_capacity<I: IntoIterator<Item = J> + Clone, J: IntoIterator<Item = A>>(
-        iter: &I,
-        length: Option<usize>,
-    ) -> usize {
-        length.unwrap_or_else(|| {
-            iter.clone()
-                .into_iter()
-                .map(|inner_iter| inner_iter.into_iter().size_hint().0)
-                .sum()
-        })
-    }
-
-    fn _from_iter_nested<I: IntoIterator<Item = J> + Clone, J: IntoIterator<Item = A>>(
+    fn from_iter_nested<I: IntoIterator<Item = J>, J: IntoIterator<Item = A>>(
         iter: I,
         capacity: usize,
     ) -> Self;
 }
 
 impl<A> FromNestedIterator<A> for Vec<A> {
-    fn _from_iter_nested<I: IntoIterator<Item = J> + Clone, J: IntoIterator<Item = A>>(
+    fn from_iter_nested<I: IntoIterator<Item = J>, J: IntoIterator<Item = A>>(
         iter: I,
         capacity: usize,
     ) -> Self {
@@ -44,26 +24,26 @@ impl<A> FromNestedIterator<A> for Vec<A> {
 pub trait CollectNested: IntoIterator {
     fn collect_nested<T: FromNestedIterator<<Self::Item as IntoIterator>::Item>>(
         self,
-        length: Option<usize>,
+        capacity: usize,
     ) -> T
     where
         Self::Item: IntoIterator,
-        Self: Sized + Clone;
+        Self: Sized;
 }
 
 impl<K: Sized> CollectNested for K
 where
-    K: IntoIterator + Clone,
+    K: IntoIterator,
     K::Item: IntoIterator,
 {
     fn collect_nested<T: FromNestedIterator<<Self::Item as IntoIterator>::Item>>(
         self,
-        length: Option<usize>,
+        capacity: usize,
     ) -> T
     where
         Self::Item: IntoIterator,
-        Self: Sized + Clone,
+        Self: Sized,
     {
-        FromNestedIterator::from_iter_nested(self, length)
+        FromNestedIterator::from_iter_nested(self, capacity)
     }
 }

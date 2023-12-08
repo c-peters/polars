@@ -1,4 +1,4 @@
-use polars_utils::iter::nested::FromNestedIterator;
+use polars_utils::iter::nested::{CollectNested, FromNestedIterator};
 use polars_utils::iter::IntoIteratorCopied;
 
 use super::{MutablePrimitiveArray, PrimitiveArray};
@@ -72,8 +72,8 @@ impl<T: NativeType> IntoIteratorCopied for PrimitiveArray<T> {
     }
 }
 
-impl<T: NativeType> FromNestedIterator<Option<T>> for PrimitiveArray<T> {
-    fn _from_iter_nested<I: IntoIterator<Item = J> + Clone, J: IntoIterator<Item = Option<T>>>(
+impl<T: NativeType> FromNestedIterator<Option<T>> for MutablePrimitiveArray<T> {
+    fn from_iter_nested<I: IntoIterator<Item = J>, J: IntoIterator<Item = Option<T>>>(
         iter: I,
         capacity: usize,
     ) -> Self {
@@ -81,6 +81,16 @@ impl<T: NativeType> FromNestedIterator<Option<T>> for PrimitiveArray<T> {
         for inner_iter in iter.into_iter() {
             arr.extend(inner_iter)
         }
-        arr.into()
+        arr
+    }
+}
+
+impl<T: NativeType> FromNestedIterator<Option<T>> for PrimitiveArray<T> {
+    fn from_iter_nested<I: IntoIterator<Item = J>, J: IntoIterator<Item = Option<T>>>(
+        iter: I,
+        capacity: usize,
+    ) -> Self {
+        let mut_arr: MutablePrimitiveArray<T> = iter.collect_nested(capacity);
+        mut_arr.into()
     }
 }

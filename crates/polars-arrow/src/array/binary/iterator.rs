@@ -44,10 +44,7 @@ impl<'a, O: Offset> IntoIterator for &'a MutableBinaryValuesArray<O> {
 }
 
 impl<'a> FromNestedIterator<Option<&'a [u8]>> for BinaryArray<i64> {
-    fn _from_iter_nested<
-        I: IntoIterator<Item = J> + Clone,
-        J: IntoIterator<Item = Option<&'a [u8]>>,
-    >(
+    fn from_iter_nested<I: IntoIterator<Item = J>, J: IntoIterator<Item = Option<&'a [u8]>>>(
         iter: I,
         capacity: usize,
     ) -> Self {

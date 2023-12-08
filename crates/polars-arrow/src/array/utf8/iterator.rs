@@ -81,10 +81,7 @@ impl<'a, O: Offset> IntoIterator for &'a MutableUtf8ValuesArray<O> {
 }
 
 impl<'a> FromNestedIterator<Option<&'a str>> for Utf8Array<i64> {
-    fn _from_iter_nested<
-        I: IntoIterator<Item = J> + Clone,
-        J: IntoIterator<Item = Option<&'a str>>,
-    >(
+    fn from_iter_nested<I: IntoIterator<Item = J>, J: IntoIterator<Item = Option<&'a str>>>(
         iter: I,
         capacity: usize,
     ) -> Self {

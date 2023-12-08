@@ -72,10 +72,7 @@ unsafe impl<'a> ArrayAccessor<'a> for BooleanArray {
 }
 
 impl FromNestedIterator<Option<bool>> for BooleanArray {
-    fn _from_iter_nested<
-        I: IntoIterator<Item = J> + Clone,
-        J: IntoIterator<Item = Option<bool>>,
-    >(
+    fn from_iter_nested<I: IntoIterator<Item = J>, J: IntoIterator<Item = Option<bool>>>(
         iter: I,
         capacity: usize,
     ) -> Self {
