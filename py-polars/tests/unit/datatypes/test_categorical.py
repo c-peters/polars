@@ -766,3 +766,43 @@ def test_shift_over_13041() -> None:
         "id": [0, 0, 0, 1, 1, 1],
         "cat_col": [None, None, "a", None, None, "d"],
     }
+
+
+def test_append_extend_series_with_string_cast() -> None:
+    s1 = pl.Series(["cat1", "cat2", "cat1"], dtype=pl.Categorical)
+    string_col = pl.Series(["b"])
+    s2 = s1.append(string_col)
+    assert s2.dtype == pl.Categorical
+
+    s2 = s1.extend(string_col)
+    assert s2.dtype == pl.Categorical
+
+def test_append_expr_with_string_cast() -> None:
+    df = pl.DataFrame(
+        [pl.Series("cat", ["cat1", "cat2", "cat1"], dtype=pl.Categorical)]
+    )
+    string_col = pl.Series(["b"])
+    df_select = df.select(pl.col("cat").append(string_col))
+    assert df_select.get_column("cat").dtype == pl.Categorical
+
+
+def test_coalesce_with_string_cast() -> None:
+    df = pl.DataFrame(
+        [
+            pl.Series(
+                "cat", ["cat1", None, None, "cat2", "cat1"], dtype=pl.Categorical
+            ),
+            pl.Series("s", ["1", "1", "1", "1", "1"]),
+        ]
+    )
+    df_coalesce = df.select(pl.coalesce(["cat", "s"]).alias("cat"))
+    assert df_coalesce.get_column("cat").dtype == pl.Categorical
+
+
+def test_zip_with_string_cast() -> None:
+    s1 = pl.Series(["cat1", "cat2", "cat1"], dtype=pl.Categorical)
+    string_col = pl.Series(["b"])
+    mask = pl.Series([True, False, True])
+    s2 = s1.zip_with(mask, string_col)
+    assert s2.dtype == pl.Categorical
+    assert s2.to_list() == ["cat1", "b", "cat1"]

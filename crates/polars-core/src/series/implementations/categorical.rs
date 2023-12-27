@@ -159,12 +159,33 @@ impl SeriesTrait for SeriesWrap<CategoricalChunked> {
     }
 
     fn append(&mut self, other: &Series) -> PolarsResult<()> {
-        polars_ensure!(self.0.dtype() == other.dtype(), append);
+        let other = match other.dtype() {
+            DataType::String => {
+                let dtype = enum_or_default_categorical(
+                    &Some(self.0.get_rev_map().clone()),
+                    self.0.get_ordering(),
+                );
+                other.cast(&dtype)?
+            },
+            DataType::Categorical(_, _) => other.clone(),
+            _ => polars_bail!(append),
+        };
+
         self.0.append(other.categorical().unwrap())
     }
 
     fn extend(&mut self, other: &Series) -> PolarsResult<()> {
-        polars_ensure!(self.0.dtype() == other.dtype(), extend);
+        let other = match other.dtype() {
+            DataType::String => {
+                let dtype = enum_or_default_categorical(
+                    &Some(self.0.get_rev_map().clone()),
+                    self.0.get_ordering(),
+                );
+                other.cast(&dtype)?
+            },
+            DataType::Categorical(_, _) => other.clone(),
+            _ => polars_bail!(extend),
+        };
         let other_ca = other.categorical().unwrap();
         // Fast path for globals of the same source
         let rev_map_self = self.0.get_rev_map();

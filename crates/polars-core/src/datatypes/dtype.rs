@@ -448,6 +448,8 @@ pub(crate) fn can_extend_dtype(left: &DataType, right: &DataType) -> PolarsResul
         // Other way around we don't allow because we keep left dtype as is.
         // We don't go to supertype, and we certainly don't want to cast self to null type.
         (_, DataType::Null) => Ok(true),
+        #[cfg(feature = "dtype-categorical")]
+        (DataType::Categorical(_, _), DataType::String) => Ok(false),
         (l, r) => {
             polars_ensure!(l == r, SchemaMismatch: "cannot extend/append {:?} with {:?}", left, right);
             Ok(false)

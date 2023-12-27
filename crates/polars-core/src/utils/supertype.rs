@@ -190,6 +190,11 @@ pub fn get_supertype(l: &DataType, r: &DataType) -> Option<DataType> {
             #[cfg(feature = "dtype-time")]
             (Time, Float64) => Some(Float64),
 
+            #[cfg(feature="dtype-categorical")]
+            (Categorical(opt_rev_map, ordering), String) => {
+                Some(enum_or_default_categorical(opt_rev_map, *ordering))
+            },
+
             // every known type can be casted to a string except binary
             (dt, String) if dt != &DataType::Unknown && dt != &DataType::Binary => Some(String),
 

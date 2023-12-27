@@ -83,7 +83,7 @@ def test_replace_enum_to_str() -> None:
 
     result = s.replace({"a": "c", "b": "d"})
 
-    expected = pl.Series(["c", "d", "c"], dtype=pl.String)
+    expected = pl.Series(["c", "d", "c"], dtype=dtype)
     assert_series_equal(result, expected)
 
 

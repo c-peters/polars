@@ -49,10 +49,7 @@ def test_concat_align() -> None:
                 {"b": ["a", "b"], "c": [3, 4]},
                 schema_overrides={"c": pl.UInt8},
             ),
-            pl.DataFrame(
-                {"a": [5, 6], "c": [5, 6], "d": [5, 6], "b": ["x", "y"]},
-                schema_overrides={"b": pl.Categorical},
-            ),
+            pl.DataFrame({"a": [5, 6], "c": [5, 6], "d": [5, 6], "b": ["x", "y"]}),
             "diagonal_relaxed",
         ),
     ],
