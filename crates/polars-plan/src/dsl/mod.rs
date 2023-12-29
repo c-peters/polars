@@ -252,7 +252,7 @@ impl Expr {
     /// Append expressions. This is done by adding the chunks of `other` to this [`Series`].
     pub fn append<E: Into<Expr>>(self, other: E, upcast: bool) -> Self {
         let output_type = if upcast {
-            GetOutput::super_type()
+            GetOutput::super_type(true)
         } else {
             GetOutput::same_type()
         };
@@ -262,9 +262,21 @@ impl Expr {
             other.into(),
             move |mut a, mut b| {
                 if upcast {
-                    let dtype = try_get_supertype(a.dtype(), b.dtype())?;
-                    a = a.cast(&dtype)?;
-                    b = b.cast(&dtype)?;
+                    match (a.dtype(), b.dtype()) {
+                        #[cfg(feature = "dtype-categorical")]
+                        (DataType::Categorical(_, _), DataType::String) => {
+                            b = b.cast(a.dtype())?;
+                            let mut ca = a.categorical().unwrap().clone();
+                            // Safety: rev maps are compatible only strings got appended
+                            unsafe { ca.set_rev_map_from_ca(b.categorical().unwrap()) }
+                            a = ca.into_series();
+                        },
+                        (adt, bdt) => {
+                            let dtype = try_get_supertype(adt, bdt)?;
+                            a = a.cast(&dtype)?;
+                            b = b.cast(&dtype)?;
+                        },
+                    };
                 }
                 a.append(&b)?;
                 Ok(Some(a))

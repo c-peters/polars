@@ -159,32 +159,36 @@ impl SeriesTrait for SeriesWrap<CategoricalChunked> {
     }
 
     fn append(&mut self, other: &Series) -> PolarsResult<()> {
-        let other = match other.dtype() {
+        match other.dtype() {
             DataType::String => {
-                let dtype = enum_or_default_categorical(
-                    &Some(self.0.get_rev_map().clone()),
-                    self.0.get_ordering(),
-                );
-                other.cast(&dtype)?
+                let other = other.cast(&self.dtype())?;
+                let other_ca = other.categorical().unwrap();
+                // Safety: we only appended categories after
+                unsafe {
+                    self.0
+                        .set_rev_map(other_ca.get_rev_map().clone(), other_ca.can_fast_unique())
+                }
+                self.0.append(other.categorical().unwrap())
             },
-            DataType::Categorical(_, _) => other.clone(),
+            DataType::Categorical(_, _) => self.0.append(other.categorical().unwrap()),
             _ => polars_bail!(append),
-        };
-
-        self.0.append(other.categorical().unwrap())
+        }
     }
 
     fn extend(&mut self, other: &Series) -> PolarsResult<()> {
         let other = match other.dtype() {
             DataType::String => {
-                let dtype = enum_or_default_categorical(
-                    &Some(self.0.get_rev_map().clone()),
-                    self.0.get_ordering(),
-                );
-                other.cast(&dtype)?
+                let other = other.cast(&self.dtype())?;
+                let other_ca = other.categorical().unwrap();
+                // Safety: we only appended categories after
+                unsafe {
+                    self.0
+                        .set_rev_map(other_ca.get_rev_map().clone(), other_ca.can_fast_unique())
+                }
+                other
             },
             DataType::Categorical(_, _) => other.clone(),
-            _ => polars_bail!(extend),
+            _ => polars_bail!(append),
         };
         let other_ca = other.categorical().unwrap();
         // Fast path for globals of the same source

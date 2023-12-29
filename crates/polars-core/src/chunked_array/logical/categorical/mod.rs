@@ -262,6 +262,12 @@ impl CategoricalChunked {
         }
     }
 
+    /// # Safety
+    /// The other categorical has a [`RevMapping`] which is compatible
+    pub unsafe fn set_rev_map_from_ca(&mut self, ca: &CategoricalChunked) {
+        unsafe { self.set_rev_map(ca.get_rev_map().clone(), ca.can_fast_unique()) }
+    }
+
     pub(crate) fn can_fast_unique(&self) -> bool {
         self.bit_settings.contains(BitSettings::ORIGINAL) && self.physical.chunks.len() == 1
     }

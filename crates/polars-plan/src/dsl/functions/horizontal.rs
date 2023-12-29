@@ -42,7 +42,7 @@ where
     Expr::AnonymousFunction {
         input: exprs,
         function,
-        output_type: GetOutput::super_type(),
+        output_type: GetOutput::super_type(false),
         options: FunctionOptions {
             collect_groups: ApplyOptions::GroupWise,
             input_wildcard_expansion: true,
@@ -85,7 +85,7 @@ where
     Expr::AnonymousFunction {
         input: exprs,
         function,
-        output_type: GetOutput::super_type(),
+        output_type: GetOutput::super_type(false),
         options: FunctionOptions {
             collect_groups: ApplyOptions::GroupWise,
             input_wildcard_expansion: true,

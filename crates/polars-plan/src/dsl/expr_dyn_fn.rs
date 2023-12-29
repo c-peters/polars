@@ -297,11 +297,18 @@ impl GetOutput {
         })
     }
 
-    pub fn super_type() -> Self {
-        Self::map_dtypes(|dtypes| {
+    #[allow(unused_variables)]
+    pub fn super_type(categorical_aware: bool) -> Self {
+        Self::map_dtypes(move |dtypes| {
             let mut st = dtypes[0].clone();
             for dt in &dtypes[1..] {
-                st = get_supertype(&st, dt).unwrap();
+                st = match (&st, dt) {
+                    #[cfg(feature = "dtype-categorical")]
+                    (DataType::Categorical(_, _), DataType::String) if categorical_aware => {
+                        st.clone()
+                    },
+                    (st, dt) => get_supertype(st, dt).unwrap(),
+                }
             }
             st
         })

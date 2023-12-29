@@ -424,7 +424,28 @@ impl Series {
     /// from `other` where the mask evaluates `false`
     #[cfg(feature = "zip_with")]
     pub fn zip_with(&self, mask: &BooleanChunked, other: &Series) -> PolarsResult<Series> {
-        let (lhs, rhs) = coerce_lhs_rhs(self, other)?;
+        let (lhs, rhs) = match (self.dtype(), other.dtype()) {
+            (DataType::Categorical(_, _), DataType::String) => {
+                let other = other.cast(&self.dtype())?;
+
+                let other_ca = other.categorical().unwrap();
+                dbg!(other_ca.physical());
+                dbg!(other_ca.get_rev_map().get_categories());
+
+                let self_ca = self.categorical().unwrap();
+                if !other_ca.get_rev_map().same_src(self_ca.get_rev_map()) {
+                    let mut lhs = self_ca.clone();
+                    // Safety: we only appended categories after
+                    unsafe {
+                        lhs.set_rev_map(other_ca.get_rev_map().clone(), other_ca.can_fast_unique());
+                    }
+                    (Cow::Owned(lhs.into_series()), Cow::Owned(other))
+                } else {
+                    (Cow::Borrowed(self), Cow::Owned(other))
+                }
+            },
+            _ => coerce_lhs_rhs(self, other)?,
+        };
         lhs.zip_with_same_type(mask, rhs.as_ref())
     }
 
