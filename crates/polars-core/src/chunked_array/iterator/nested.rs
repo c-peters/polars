@@ -1,10 +1,9 @@
-use arrow::array::{BinaryArray, PrimitiveArray, Utf8Array};
+use arrow::array::{BinaryViewArray, PrimitiveArray, Utf8ViewArray};
 use polars_utils::iter::nested::{CollectNested, FromNestedIterator};
 
 use crate::datatypes::PolarsNumericType;
-use crate::prelude::{BinaryChunked, ChunkedArray, Utf8Chunked};
+use crate::prelude::{BinaryChunked, ChunkedArray, StringChunked};
 use crate::utils::NoNull;
-
 impl<T> FromNestedIterator<Option<T::Native>> for ChunkedArray<T>
 where
     T: PolarsNumericType,
@@ -32,12 +31,12 @@ where
     }
 }
 
-impl<'a> FromNestedIterator<Option<&'a str>> for Utf8Chunked {
+impl<'a> FromNestedIterator<Option<&'a str>> for StringChunked {
     fn from_iter_nested<I: IntoIterator<Item = J>, J: IntoIterator<Item = Option<&'a str>>>(
         iter: I,
         capacity: usize,
     ) -> Self {
-        let arr: Utf8Array<i64> = iter.collect_nested(capacity);
+        let arr: Utf8ViewArray = iter.collect_nested(capacity);
         ChunkedArray::with_chunk("", arr)
     }
 }
@@ -47,7 +46,7 @@ impl<'a> FromNestedIterator<Option<&'a [u8]>> for BinaryChunked {
         iter: I,
         capacity: usize,
     ) -> Self {
-        let arr: BinaryArray<i64> = iter.collect_nested(capacity);
+        let arr: BinaryViewArray = iter.collect_nested(capacity);
         ChunkedArray::with_chunk("", arr)
     }
 }
