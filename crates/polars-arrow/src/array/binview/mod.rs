@@ -526,8 +526,8 @@ mod tests {
 
     #[test]
     fn test_equality() {
-        let lhs: Utf8ViewArray = Utf8ViewArray::from_slice(&[Some("a"), Some("b")]);
-        let rhs: Utf8ViewArray = Utf8ViewArray::from_slice(&[Some("a")]);
+        let lhs: Utf8ViewArray = Utf8ViewArray::from_slice([Some("a"), Some("b")]);
+        let rhs: Utf8ViewArray = Utf8ViewArray::from_slice([Some("a")]);
         assert_ne!(lhs, rhs);
     }
 }
