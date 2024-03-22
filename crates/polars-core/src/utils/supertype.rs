@@ -190,6 +190,20 @@ pub fn get_supertype(l: &DataType, r: &DataType) -> Option<DataType> {
             #[cfg(feature = "dtype-time")]
             (Time, Float64) => Some(Float64),
 
+            #[cfg(feature = "dtype-categorical")]
+            (Enum(None,_),Enum(Some(rev_map),_)) | (Enum(Some(rev_map),_), Enum(None,_)) => Some(Enum(Some(rev_map.clone()),Default::default())),
+
+            // Allow Enum conversion if one of the two has additional categories
+            #[cfg(feature = "dtype-categorical")]
+            (Enum(Some(revmap_lhs),_),Enum(Some(revmap_rhs),_)) if revmap_lhs.get_categories().iter().zip(revmap_rhs.get_categories().iter()).all(|(l,r)| l == r) =>{
+                if revmap_lhs.len() >= revmap_rhs.len(){
+                    Some(Enum(Some(revmap_lhs.clone()),Default::default()))
+                }else{
+                    Some(Enum(Some(revmap_rhs.clone()),Default::default()))
+                }
+
+            }
+
             // every known type can be casted to a string except binary
             (dt, String) if dt != &DataType::Unknown && dt != &DataType::Binary => Some(String),
 

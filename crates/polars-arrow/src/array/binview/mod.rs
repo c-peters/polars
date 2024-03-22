@@ -122,7 +122,7 @@ pub struct BinaryViewArrayGeneric<T: ViewType + ?Sized> {
 
 impl<T: ViewType + ?Sized> PartialEq for BinaryViewArrayGeneric<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.into_iter().zip(other).all(|(l, r)| l == r)
+        self.len() == other.len() && self.into_iter().zip(other).all(|(l, r)| l == r)
     }
 }
 
@@ -517,5 +517,17 @@ impl<T: ViewType + ?Sized> Array for BinaryViewArrayGeneric<T> {
 
     fn to_boxed(&self) -> Box<dyn Array> {
         Box::new(self.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_equality() {
+        let lhs: Utf8ViewArray = Utf8ViewArray::from_slice(&[Some("a"), Some("b")]);
+        let rhs: Utf8ViewArray = Utf8ViewArray::from_slice(&[Some("a")]);
+        assert_ne!(lhs, rhs);
     }
 }

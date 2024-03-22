@@ -214,8 +214,8 @@ def test_append_to_an_enum() -> None:
 
 def test_append_to_an_enum_with_new_category() -> None:
     with pytest.raises(
-        pl.ComputeError,
-        match=("can not merge incompatible Enum types"),
+        pl.SchemaError,
+        match=("cannot extend/append"),
     ):
         pl.Series([None, "a", "b", "c"], dtype=pl.Enum(["a", "b", "c"])).append(
             pl.Series(["d", "a", "b", "c"], dtype=pl.Enum(["a", "b", "c", "d"]))
