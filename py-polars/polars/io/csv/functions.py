@@ -24,7 +24,7 @@ from polars.io.csv._utils import _check_arg_is_1byte, _update_columns
 from polars.io.csv.batched_reader import BatchedCsvReader
 
 with contextlib.suppress(ImportError):  # Module not available when building docs
-    from polars.polars import PyDataFrame, PyLazyFrame
+    from polars.polars import PyDataFrame, PyLazyFrame, concat_df
 
 if TYPE_CHECKING:
     from polars import DataFrame, LazyFrame
@@ -417,37 +417,46 @@ def read_csv(
         raise_if_empty=raise_if_empty,
         storage_options=storage_options,
     ) as data:
-        df = _read_csv_impl(
-            data,
-            has_header=has_header,
-            columns=columns if columns else projection,
-            separator=separator,
-            comment_prefix=comment_prefix,
-            quote_char=quote_char,
-            skip_rows=skip_rows,
-            schema_overrides=schema_overrides,
-            schema=schema,
-            null_values=null_values,
-            missing_utf8_is_empty_string=missing_utf8_is_empty_string,
-            ignore_errors=ignore_errors,
-            try_parse_dates=try_parse_dates,
-            n_threads=n_threads,
-            infer_schema_length=infer_schema_length,
-            batch_size=batch_size,
-            n_rows=n_rows,
-            encoding=encoding if encoding == "utf8-lossy" else "utf8",
-            low_memory=low_memory,
-            rechunk=rechunk,
-            skip_rows_after_header=skip_rows_after_header,
-            row_index_name=row_index_name,
-            row_index_offset=row_index_offset,
-            sample_size=sample_size,
-            eol_char=eol_char,
-            raise_if_empty=raise_if_empty,
-            truncate_ragged_lines=truncate_ragged_lines,
-            decimal_comma=decimal_comma,
-            glob=glob,
-        )
+
+        def single_read_csv_impl(file_data: str | Path | IO[str] | IO[bytes] | bytes) -> DataFrame:
+            return _read_csv_impl(
+                file_data,
+                has_header=has_header,
+                columns=columns if columns else projection,
+                separator=separator,
+                comment_prefix=comment_prefix,
+                quote_char=quote_char,
+                skip_rows=skip_rows,
+                schema_overrides=schema_overrides,
+                schema=schema,
+                null_values=null_values,
+                missing_utf8_is_empty_string=missing_utf8_is_empty_string,
+                ignore_errors=ignore_errors,
+                try_parse_dates=try_parse_dates,
+                n_threads=n_threads,
+                infer_schema_length=infer_schema_length,
+                batch_size=batch_size,
+                n_rows=n_rows,
+                encoding=encoding if encoding == "utf8-lossy" else "utf8",
+                low_memory=low_memory,
+                rechunk=rechunk,
+                skip_rows_after_header=skip_rows_after_header,
+                row_index_name=row_index_name,
+                row_index_offset=row_index_offset,
+                sample_size=sample_size,
+                eol_char=eol_char,
+                raise_if_empty=raise_if_empty,
+                truncate_ragged_lines=truncate_ragged_lines,
+                decimal_comma=decimal_comma,
+                glob=glob,
+            )
+
+        # Check if it is a list (e.g. fsspec with globbing patterns)
+        if isinstance(data,list):
+            pydf = concat_df([single_read_csv_impl(file_data) for file_data in data])
+            df = wrap_df(pydf)
+        else:
+            df = single_read_csv_impl(data)
 
     if new_columns:
         return _update_columns(df, new_columns)

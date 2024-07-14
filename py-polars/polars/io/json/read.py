@@ -3,14 +3,14 @@ from __future__ import annotations
 import contextlib
 from io import BytesIO, StringIO
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, IO
 
-from polars._utils.various import normalize_filepath
 from polars._utils.wrap import wrap_df
 from polars.datatypes import N_INFER_DEFAULT
+from polars.io._utils import prepare_file_arg
 
 with contextlib.suppress(ImportError):  # Module not available when building docs
-    from polars.polars import PyDataFrame
+    from polars.polars import PyDataFrame, concat_df
 
 if TYPE_CHECKING:
     from io import IOBase
@@ -88,15 +88,24 @@ def read_json(
     │ 3   ┆ 8.0 │
     └─────┴─────┘
     """
-    if isinstance(source, StringIO):
-        source = BytesIO(source.getvalue().encode())
-    elif isinstance(source, (str, Path)):
-        source = normalize_filepath(source)
+    with prepare_file_arg(
+            source,
+            encoding=None,
+            use_pyarrow=False,
+            raise_if_empty=False,
+            storage_options={},
+    ) as data:
+        def read_single_json_file(file_data:  str | Path | IO[str] | IO[bytes] | bytes) -> DataFrame:
+            return wrap_df(PyDataFrame.read_json(
+                file_data,
+                infer_schema_length=infer_schema_length,
+                schema=schema,
+                schema_overrides=schema_overrides,
+            ))
 
-    pydf = PyDataFrame.read_json(
-        source,
-        infer_schema_length=infer_schema_length,
-        schema=schema,
-        schema_overrides=schema_overrides,
-    )
-    return wrap_df(pydf)
+        # Check if it is a list (e.g. fsspec with globbing patterns)
+        if isinstance(data,list):
+            pydf = concat_df([read_single_json_file(file_data) for file_data in data])
+            return wrap_df(pydf)
+        else:
+            return read_single_json_file(data)

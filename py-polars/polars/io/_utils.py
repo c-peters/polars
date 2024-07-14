@@ -114,7 +114,7 @@ def prepare_file_arg(
     """
     Prepare file argument.
 
-    Utility for read_[csv, parquet]. (not to be used by scan_[csv, parquet]).
+    Utility for read_[csv, json, ndjson, parquet]. (not to be used by scan_*).
     Returned value is always usable as a context.
 
     A `StringIO`, `BytesIO` file is returned as a `BytesIO`.
@@ -219,7 +219,10 @@ def prepare_file_arg(
                         raise_if_empty=raise_if_empty,
                     )
             storage_options["encoding"] = encoding
-            return fsspec.open(file, **storage_options)
+            if is_glob_pattern(file):
+                return fsspec.open_files(file,**storage_options)
+            else:
+                return fsspec.open(file, **storage_options)
 
     if isinstance(file, list) and bool(file) and all(isinstance(f, str) for f in file):
         if _FSSPEC_AVAILABLE:
@@ -258,7 +261,7 @@ def _check_empty(
             if context in ("StringIO", "BytesIO") and read_position
             else ""
         )
-        msg = f"empty CSV data from {context}{hint}"
+        msg = f"empty data from {context}{hint}"
         raise NoDataError(msg)
     return b
 
