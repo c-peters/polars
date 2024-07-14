@@ -24,7 +24,7 @@ from polars.io.csv._utils import _check_arg_is_1byte, _update_columns
 from polars.io.csv.batched_reader import BatchedCsvReader
 
 with contextlib.suppress(ImportError):  # Module not available when building docs
-    from polars.polars import PyDataFrame, PyLazyFrame, concat_df
+    from polars.polars import PyDataFrame, PyLazyFrame, concat_df as _concat_df
 
 if TYPE_CHECKING:
     from polars import DataFrame, LazyFrame
@@ -453,7 +453,7 @@ def read_csv(
 
         # Check if it is a list (e.g. fsspec with globbing patterns)
         if isinstance(data,list):
-            pydf = concat_df([single_read_csv_impl(file_data) for file_data in data])
+            pydf = _concat_df([single_read_csv_impl(file_data) for file_data in data])
             df = wrap_df(pydf)
         else:
             df = single_read_csv_impl(data)

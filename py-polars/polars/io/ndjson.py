@@ -11,7 +11,7 @@ from polars.datatypes import N_INFER_DEFAULT
 from polars.io._utils import parse_row_index_args, prepare_file_arg
 
 with contextlib.suppress(ImportError):  # Module not available when building docs
-    from polars.polars import PyDataFrame, PyLazyFrame, concat_df
+    from polars.polars import PyDataFrame, PyLazyFrame, concat_df as _concat_df
 
 if TYPE_CHECKING:
     from io import IOBase
@@ -87,7 +87,7 @@ def read_ndjson(
 
         # Check if it is a list (e.g. fsspec with globbing patterns)
         if isinstance(data,list):
-            pydf = concat_df([read_single_ndjson_file(file_data) for file_data in data])
+            pydf = _concat_df([read_single_ndjson_file(file_data) for file_data in data])
             return wrap_df(pydf)
         else:
             return read_single_ndjson_file(data)

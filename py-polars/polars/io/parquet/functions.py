@@ -16,13 +16,15 @@ from polars._utils.wrap import wrap_df, wrap_ldf
 from polars.convert import from_arrow
 from polars.dependencies import import_optional
 from polars.io._utils import (
+    is_supported_cloud,
+    is_local_file,
     parse_columns_arg,
     parse_row_index_args,
     prepare_file_arg,
 )
 
 with contextlib.suppress(ImportError):
-    from polars.polars import PyDataFrame, PyLazyFrame
+    from polars.polars import PyDataFrame, PyLazyFrame, concat_df
     from polars.polars import read_parquet_schema as _read_parquet_schema
 
 if TYPE_CHECKING:
@@ -164,7 +166,8 @@ def read_parquet(
         )
 
     # Read file and bytes inputs using `read_parquet`
-    elif isinstance(source, (io.IOBase, bytes)):
+    # Read unsupported remote file systems using `read_parquet` through fsspec
+    elif isinstance(source, (io.IOBase, bytes)) | (isinstance(source, str) and not is_local_file(source) and not is_supported_cloud(source)):
         return _read_parquet_binary(
             source,
             columns=columns,
@@ -251,19 +254,26 @@ def _read_parquet_binary(
     projection, columns = parse_columns_arg(columns)
     row_index = parse_row_index_args(row_index_name, row_index_offset)
 
-    with prepare_file_arg(source) as source_prep:
-        pydf = PyDataFrame.read_parquet(
-            source_prep,
-            columns=columns,
-            projection=projection,
-            n_rows=n_rows,
-            row_index=row_index,
-            parallel=parallel,
-            use_statistics=use_statistics,
-            rechunk=rechunk,
-            low_memory=low_memory,
-        )
-    return wrap_df(pydf)
+    with prepare_file_arg(source) as data:
+        def read_single_parquet_file(file_data: str | Path | IO[str] | IO[bytes] | bytes) -> DataFrame:
+            return wrap_df(PyDataFrame.read_parquet(
+                file_data,
+                columns=columns,
+                projection=projection,
+                n_rows=n_rows,
+                row_index=row_index,
+                parallel=parallel,
+                use_statistics=use_statistics,
+                rechunk=rechunk,
+                low_memory=low_memory,
+            ))
+
+        # Check if it is a list (e.g. fsspec with globbing patterns)
+        if isinstance(data, list):
+            pydf = concat_df([read_single_parquet_file(file_data) for file_data in data])
+            return wrap_df(pydf)
+        else:
+            return read_single_parquet_file(data)
 
 
 def read_parquet_schema(source: str | Path | IO[bytes] | bytes) -> dict[str, DataType]:
