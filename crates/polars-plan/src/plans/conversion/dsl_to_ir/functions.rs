@@ -479,6 +479,7 @@ pub(super) fn convert_functions(
                     descending,
                     nulls_last,
                 },
+                B::IsInBloomFilter { bitset } => IB::IsInBloomFilter { bitset },
                 B::AllHorizontal => {
                     let Some(fst) = e.first() else {
                         return Ok((

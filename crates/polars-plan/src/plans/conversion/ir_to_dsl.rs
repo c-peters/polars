@@ -709,6 +709,7 @@ pub fn ir_function_to_dsl(input: Vec<Expr>, function: IRFunctionExpr) -> Expr {
                     descending,
                     nulls_last,
                 },
+                IB::IsInBloomFilter { bitset } => B::IsInBloomFilter { bitset },
                 IB::AllHorizontal => B::AllHorizontal,
                 IB::AnyHorizontal => B::AnyHorizontal,
                 IB::Not => B::Not,

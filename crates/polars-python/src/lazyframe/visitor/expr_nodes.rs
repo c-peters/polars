@@ -1598,6 +1598,11 @@ pub(crate) fn into_py(py: Python<'_>, expr: &AExpr) -> PyResult<Py<PyAny>> {
                         descending,
                         nulls_last,
                     } => (PyBooleanFunction::IsSorted, *descending, *nulls_last).into_py_any(py),
+                    // IR-only node, inserted by the distributed engine. It has
+                    // no DSL or Python counterpart to visit.
+                    IRBooleanFunction::IsInBloomFilter { .. } => {
+                        Err(PyNotImplementedError::new_err("is_in_bloom_filter"))
+                    },
                     IRBooleanFunction::AllHorizontal => {
                         (PyBooleanFunction::AllHorizontal,).into_py_any(py)
                     },

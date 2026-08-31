@@ -1,4 +1,5 @@
 mod aggregation;
+mod bloom_filter;
 #[cfg(feature = "cse")]
 mod cse;
 mod cwc;

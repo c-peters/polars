@@ -53,6 +53,15 @@ pub enum IRBooleanFunction {
     AnyHorizontal,
     // Also bitwise negate
     Not,
+    /// Whether the `UInt64` input is contained in a split-block bloom filter.
+    ///
+    /// IR-only: inserted by the distributed engine as a runtime join filter,
+    /// with no DSL or Python surface. Membership is approximate — a value that
+    /// was inserted is always accepted, but a value that was not may also be
+    /// accepted. Nulls are always rejected.
+    IsInBloomFilter {
+        bitset: Arc<[u8]>,
+    },
 }
 
 impl IRBooleanFunction {
@@ -112,6 +121,9 @@ impl IRBooleanFunction {
                 )
                 .with_flags(|f| f | FunctionFlags::PRESERVES_NULL_ALL_INPUTS),
             B::IsSorted { .. } => FunctionOptions::aggregation(),
+            // Deliberately not PRESERVES_NULL_FIRST_INPUT: a null key matches
+            // nothing, so it must be rejected rather than propagated.
+            B::IsInBloomFilter { .. } => FunctionOptions::elementwise(),
             B::AllHorizontal | B::AnyHorizontal => FunctionOptions::elementwise().with_flags(|f| {
                 f | FunctionFlags::INPUT_WILDCARD_EXPANSION | FunctionFlags::ALLOW_EMPTY_INPUTS
             }),
@@ -159,6 +171,7 @@ impl Display for IRBooleanFunction {
             #[cfg(feature = "is_close")]
             IsClose { .. } => "is_close",
             IsSorted { .. } => "is_sorted",
+            IsInBloomFilter { .. } => "is_in_bloom_filter",
             AnyHorizontal => "any_horizontal",
             AllHorizontal => "all_horizontal",
             Not => "not",

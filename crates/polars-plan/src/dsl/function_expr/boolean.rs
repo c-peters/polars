@@ -53,6 +53,13 @@ pub enum BooleanFunction {
     AnyHorizontal,
     // Also bitwise negate
     Not,
+    /// See [`super::super::super::plans::aexpr::function_expr::IRBooleanFunction::IsInBloomFilter`].
+    ///
+    /// Has no public constructor: it exists so that IR containing a runtime
+    /// join filter can still be converted back to DSL for display.
+    IsInBloomFilter {
+        bitset: Arc<[u8]>,
+    },
 }
 
 impl Display for BooleanFunction {
@@ -93,6 +100,7 @@ impl Display for BooleanFunction {
             #[cfg(feature = "is_close")]
             IsClose { .. } => "is_close",
             IsSorted { .. } => "is_sorted",
+            IsInBloomFilter { .. } => "is_in_bloom_filter",
             AnyHorizontal => "any_horizontal",
             AllHorizontal => "all_horizontal",
             Not => "not",

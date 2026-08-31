@@ -2,7 +2,9 @@ use std::ops::{BitAnd, BitOr};
 use std::sync::Arc;
 
 use polars_core::error::PolarsResult;
-use polars_core::prelude::{BooleanChunked, Column, DataType, IntoColumn, NamedFrom};
+use polars_core::prelude::{
+    BooleanChunked, Column, DataType, IntoColumn, NamedFrom, polars_ensure,
+};
 use polars_core::runtime::RAYON;
 use polars_ops::prelude::SeriesMethods;
 use polars_plan::dsl::{ColumnsUdf, SpecialEq};
@@ -46,6 +48,7 @@ pub fn function_expr_to_udf(func: IRBooleanFunction) -> SpecialEq<Arc<dyn Column
             descending,
             nulls_last,
         } => map!(is_sorted, descending, nulls_last),
+        IsInBloomFilter { bitset } => map!(is_in_bloom_filter, &bitset),
         Not => map!(not),
         AllHorizontal => map_as_slice!(all_horizontal),
         AnyHorizontal => map_as_slice!(any_horizontal),
@@ -182,6 +185,28 @@ fn is_sorted(
     Ok(Column::new(s.name().clone(), [result]))
 }
 
+/// Probes a split-block bloom filter with the `UInt64` values of `c`.
+///
+/// Nulls yield `false`: a null join key matches nothing. False positives are
+/// possible by construction; false negatives are not.
+fn is_in_bloom_filter(c: &Column, bitset: &[u8]) -> PolarsResult<Column> {
+    polars_ensure!(
+        !bitset.is_empty() && bitset.len() % polars_compute::bloom_filter::BLOCK_BYTES == 0,
+        ComputeError:
+            "bloom filter bitset must be a non-zero multiple of {} bytes, got {}",
+            polars_compute::bloom_filter::BLOCK_BYTES,
+            bitset.len()
+    );
+
+    let ca = c.u64()?;
+    let mut out: BooleanChunked = ca
+        .iter()
+        .map(|opt| opt.is_some_and(|v| polars_compute::bloom_filter::is_in_set(bitset, v)))
+        .collect();
+    out.rename(c.name().clone());
+    Ok(out.into_column())
+}
+
 fn not(s: &Column) -> PolarsResult<Column> {
     polars_ops::series::negate_bitwise(s.as_materialized_series()).map(Column::from)
 }
@@ -228,4 +253,66 @@ fn all_horizontal(s: &[Column]) -> PolarsResult<Column> {
         })?
         .with_name(s[0].name().clone());
     Ok(out.into_column())
+}
+
+#[cfg(test)]
+mod tests {
+    use polars_compute::bloom_filter::{BLOCK_BYTES, insert, num_bytes_for};
+    use polars_core::prelude::*;
+
+    use super::is_in_bloom_filter;
+
+    fn filter_over(values: &[u64]) -> Vec<u8> {
+        let mut bitset = vec![0u8; num_bytes_for(values.len().max(1), 0.01, 1 << 16)];
+        for v in values {
+            insert(&mut bitset, *v);
+        }
+        bitset
+    }
+
+    #[test]
+    fn accepts_every_inserted_value() {
+        let values: Vec<u64> = (0..1000)
+            .map(|i: u64| i.wrapping_mul(0x9e37_79b9))
+            .collect();
+        let bitset = filter_over(&values);
+
+        let col = Column::new("k".into(), &values);
+        let out = is_in_bloom_filter(&col, &bitset).unwrap();
+
+        // No false negatives: every inserted value must survive.
+        assert_eq!(out.bool().unwrap().sum(), Some(values.len() as u32));
+    }
+
+    #[test]
+    fn nulls_are_rejected_not_propagated() {
+        let bitset = filter_over(&[7]);
+
+        let col = Column::new("k".into(), [Some(7u64), None, Some(8u64)]);
+        let out = is_in_bloom_filter(&col, &bitset).unwrap();
+        let out = out.bool().unwrap();
+
+        // A null key matches nothing, so it must come back as `false` rather
+        // than null -- a null would be dropped by a filter, but it would also
+        // poison `!expr` for any caller that negates the predicate.
+        assert_eq!(out.null_count(), 0);
+        assert_eq!(out.get(0), Some(true));
+        assert_eq!(out.get(1), Some(false));
+    }
+
+    #[test]
+    fn rejects_malformed_bitset() {
+        let col = Column::new("k".into(), [1u64]);
+
+        assert!(is_in_bloom_filter(&col, &[]).is_err());
+        assert!(is_in_bloom_filter(&col, &vec![0u8; BLOCK_BYTES + 1]).is_err());
+        assert!(is_in_bloom_filter(&col, &vec![0u8; BLOCK_BYTES]).is_ok());
+    }
+
+    #[test]
+    fn rejects_non_u64_input() {
+        let bitset = filter_over(&[1]);
+        let col = Column::new("k".into(), ["a", "b"]);
+        assert!(is_in_bloom_filter(&col, &bitset).is_err());
+    }
 }
