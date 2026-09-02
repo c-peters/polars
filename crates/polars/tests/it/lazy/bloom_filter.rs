@@ -110,3 +110,50 @@ fn nulls_do_not_survive_the_filter() {
     assert_eq!(out.height(), 1);
     assert_eq!(out.column("k").unwrap().u64().unwrap().get(0), Some(10));
 }
+
+/// The distributed engine puts this expression on a scan's predicate, so
+/// pushdown has to accept it and the scan has to evaluate it. The streaming
+/// parquet reader then decodes only the key column before filtering.
+#[test]
+fn pushes_down_into_a_parquet_scan() {
+    let dir = std::env::temp_dir().join(format!(
+        "polars-bloom-filter-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("keys.parquet");
+
+    let mut df = df![
+        "k" => [10u64, 11, 20, 21, 30, 31, 40, 41],
+        "v" => [0i64, 1, 2, 3, 4, 5, 6, 7],
+    ]
+    .unwrap();
+    let file = std::fs::File::create(&path).unwrap();
+    ParquetWriter::new(file).finish(&mut df).unwrap();
+
+    let bitset = filter_over(&BUILD_KEYS);
+    let lf = LazyFrame::scan_parquet(PlRefPath::new(path.to_str().unwrap()), Default::default())
+        .unwrap()
+        .filter(is_in_bloom_filter(col("k"), bitset));
+
+    // The predicate has to reach the scan; a `FILTER` above it would mean
+    // pushdown rejected the expression and the reader decodes every column.
+    let plan = lf.clone().explain(true).unwrap();
+    assert!(
+        plan.contains("SELECTION") && plan.contains("is_in_bloom_filter"),
+        "predicate did not reach the scan:\n{plan}"
+    );
+
+    let out = lf.collect().unwrap();
+    let kept: Vec<u64> = out
+        .column("k")
+        .unwrap()
+        .u64()
+        .unwrap()
+        .into_no_null_iter()
+        .collect();
+    assert_eq!(kept, BUILD_KEYS.to_vec());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
