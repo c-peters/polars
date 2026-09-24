@@ -413,6 +413,7 @@ impl FileReader for ParquetFileReader {
                 &mut self.row_group_prefetch_sync.current_all_spawned,
             ),
             disable_morsel_split,
+            io_metrics: self.io_metrics.clone(),
         }
         .run();
 
@@ -502,6 +503,9 @@ struct ParquetReadImpl {
     rg_prefetch_prev_all_spawned: Option<WaitGroup>,
     rg_prefetch_current_all_spawned: Option<WaitToken>,
     disable_morsel_split: bool,
+    /// Carried down so the detached decode tasks can be attributed to the same
+    /// node the byte counters already belong to.
+    io_metrics: OptIOMetrics,
 }
 
 #[derive(Debug)]

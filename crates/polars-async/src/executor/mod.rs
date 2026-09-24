@@ -105,6 +105,16 @@ impl Drop for TaskMetadata {
     }
 }
 
+/// Receives the metrics of a task that was spawned on the observer's behalf.
+///
+/// A task spawned detached carries no node key, so nothing in the graph collects
+/// its `TaskMetrics`. Handing a sink to whoever spawns it is how that CPU gets
+/// attributed; see `parallelize_first_to_local_observed`.
+pub trait SpawnedTaskObserver: Send + Sync + 'static {
+    /// Called once, after the task has completed.
+    fn task_finished(&self, metrics: &TaskMetrics);
+}
+
 pub struct JoinHandle<T>(Arc<dyn DynTask<T, TaskMetadata>>);
 pub struct CancelHandle(Weak<dyn Cancellable>);
 
@@ -147,6 +157,11 @@ pub struct AbortOnDropHandle<T> {
 }
 
 impl<T> AbortOnDropHandle<T> {
+    /// The wrapped task's metrics, if metric tracking is on.
+    pub fn metrics(&self) -> Option<&Arc<TaskMetrics>> {
+        self.join_handle.metrics()
+    }
+
     pub fn new(join_handle: JoinHandle<T>) -> Self {
         let cancel_handle = join_handle.cancel_handle();
         Self {

@@ -14,6 +14,7 @@ use polars_utils::IdxSize;
 use super::row_group_data_fetch::RowGroupDataFetcher;
 use super::row_group_decode::{DynamicConjunct, PredicateColumn, RowGroupDecoder, Source};
 use super::{AsyncTaskData, ParquetReadImpl};
+use crate::metrics::OptIOMetrics;
 use crate::morsel::{Morsel, SourceToken, get_ideal_morsel_size};
 use crate::nodes::io_sources::multi_scan::reader_interface::output::FileReaderOutputSend;
 use crate::nodes::io_sources::parquet::projection::ArrowFieldProjection;
@@ -41,6 +42,49 @@ fn filter_while_decoding(projection: &ArrowFieldProjection) -> bool {
         | A::FixedSizeBinary(_) => false,
         dtype => !dtype.is_nested(),
     }
+}
+
+/// Awaits one decode task and attributes its CPU to the scan node.
+///
+/// Decode tasks are spawned detached, so `run_subgraph`'s registration never sees
+/// them and their poll time is missing from `NodeMetrics::total_poll_time_ns`.
+/// Their `TaskMetrics` do exist -- the free `executor::spawn` builds them exactly
+/// as the scoped one does -- so all that is needed is to read them somewhere the
+/// node is still reachable.
+///
+/// This covers the parent task only. The column chunks it fans out to are
+/// covered by `DecodeTaskObserver`, whose doc explains when the fan-out happens
+/// and why attributing only the parent under-reports filtered scans badly.
+///
+/// One known gap remains, under-counting: a decode whose future is dropped
+/// rather than awaited -- the early `return` paths below, reached when the
+/// downstream cancels, e.g. under a LIMIT -- is never folded. Dropping a
+/// `JoinHandle` does not cancel the task, so it runs to completion and burns CPU
+/// that goes unrecorded. Closing that needs the fold to happen on task
+/// completion instead of at the await, which means an ambient node key in
+/// `TaskMetadata` -- an executor-wide change, not a local one.
+async fn await_decode(
+    decode_fut: executor::JoinHandle<PolarsResult<DataFrame>>,
+    io_metrics: &OptIOMetrics,
+) -> PolarsResult<DataFrame> {
+    // Read before the await, which consumes the handle; fold after it. No
+    // enabled-check needed: `metrics()` is `None` when tracking is off, and
+    // `add_decode_task` no-ops when this node has no metrics.
+    //
+    // Note the executor records a poll's time *after* `task.run()` returns, while
+    // `run` wakes the joiner from inside itself (`executor/task.rs`), so the last
+    // poll's contribution can in principle be missed if this thread resumes first.
+    // The window is a few atomics wide against scheduling latency and measured
+    // totals are stable run to run, but it is a real race; closing it means
+    // recording inside `run`, before the wake.
+    let task_metrics = decode_fut.metrics().cloned();
+    let out = decode_fut.await;
+    // Fold before propagating: a decode that errored still burned the CPU, and
+    // unlike the dropped-future case below its metrics are already in hand.
+    if let Some(m) = task_metrics {
+        io_metrics.add_decode_task(m.total_poll_time_ns.load());
+    }
+    out
 }
 
 impl ParquetReadImpl {
@@ -245,6 +289,7 @@ impl ParquetReadImpl {
         // is shared across files in the scan.
         let last_morsel_pipelines = self.config.last_morsel_pipelines;
         let disable_morsel_split = self.disable_morsel_split;
+        let io_metrics = self.io_metrics.clone();
         let distribute_task = executor::spawn(TaskPriority::High, async move {
             let mut morsel_seq = MorselSeq::default();
             // Note: We don't use this (it is handled by the bridge). But morsels require a source token.
@@ -256,7 +301,7 @@ impl ParquetReadImpl {
                 let Some((decode_fut, permits)) = decode_recv.recv().await else {
                     break;
                 };
-                let df = decode_fut.await?;
+                let df = await_decode(decode_fut, &io_metrics).await?;
                 if df.height() == 0 {
                     continue;
                 }
@@ -294,7 +339,7 @@ impl ParquetReadImpl {
                     let Some((decode_fut, permit)) = decode_recv.recv().await else {
                         break;
                     };
-                    let next_df = decode_fut.await?;
+                    let next_df = await_decode(decode_fut, &io_metrics).await?;
                     if next_df.height() == 0 {
                         continue;
                     }
@@ -484,6 +529,10 @@ impl ParquetReadImpl {
             passes: Mutex::new(Arc::new(passes)),
             non_predicate_field_indices,
             target_values_per_thread,
+            decode_observer: self.io_metrics.0.clone().map(|m| {
+                Arc::new(crate::metrics::DecodeTaskObserver(m))
+                    as Arc<dyn polars_async::executor::SpawnedTaskObserver>
+            }),
         }
     }
 }

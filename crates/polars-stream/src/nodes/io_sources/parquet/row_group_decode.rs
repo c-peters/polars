@@ -1,8 +1,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use polars_async::executor::TaskPriority;
-use polars_async::primitives::opt_spawned_future::parallelize_first_to_local;
+use polars_async::executor::{SpawnedTaskObserver, TaskPriority};
+use polars_async::primitives::opt_spawned_future::parallelize_first_to_local_observed;
 use polars_core::frame::DataFrame;
 use polars_core::prelude::{ArrowField, BooleanChunked, ChunkFilter, Column, DataType, IntoColumn};
 use polars_core::scalar::Scalar;
@@ -120,6 +120,9 @@ pub(super) struct RowGroupDecoder {
     /// Indices into `projected_arrow_fields. This must be sorted.
     pub(super) non_predicate_field_indices: Arc<[usize]>,
     pub(super) target_values_per_thread: usize,
+    /// Built once per reader and cloned into each spawned column-decode chunk so
+    /// its CPU reaches the scan node. `None` when metrics are off.
+    pub(super) decode_observer: Option<Arc<dyn SpawnedTaskObserver>>,
 }
 
 impl RowGroupDecoder {
@@ -203,8 +206,13 @@ impl RowGroupDecoder {
             let mask = predicate.predicate.evaluate_io(&df)?;
             let mask = mask.bool().unwrap();
 
-            let filtered =
-                filter_cols(df.into_columns(), mask, self.target_values_per_thread).await?;
+            let filtered = filter_cols(
+                df.into_columns(),
+                mask,
+                self.target_values_per_thread,
+                self.decode_observer.as_ref(),
+            )
+            .await?;
 
             let height = if let Some(fst) = filtered.first() {
                 fst.len()
@@ -276,7 +284,7 @@ impl RowGroupDecoder {
             let projected_arrow_fields = projected_arrow_fields.clone();
             let filter = filter.clone();
 
-            parallelize_first_to_local(
+            parallelize_first_to_local_observed(
                 TaskPriority::Low,
                 (0..projected_arrow_fields.len())
                     .step_by(cols_per_thread)
@@ -311,6 +319,7 @@ impl RowGroupDecoder {
                                 .collect::<PolarsResult<UnitVec<_>>>()
                         }
                     }),
+                self.decode_observer.as_ref(),
             )
         };
 
@@ -404,6 +413,7 @@ async fn filter_cols(
     cols: Vec<Column>,
     mask: &BooleanChunked,
     target_values_per_thread: usize,
+    decode_observer: Option<&Arc<dyn SpawnedTaskObserver>>,
 ) -> PolarsResult<Vec<Column>> {
     if cols.is_empty() {
         return Ok(cols);
@@ -418,7 +428,7 @@ async fn filter_cols(
         let cols = &cols;
         let mask = &mask;
 
-        parallelize_first_to_local(
+        parallelize_first_to_local_observed(
             TaskPriority::Low,
             (0..cols.len()).step_by(cols_per_thread).map(move |offset| {
                 let cols = cols.clone();
@@ -429,6 +439,7 @@ async fn filter_cols(
                         .collect::<PolarsResult<UnitVec<_>>>()
                 }
             }),
+            decode_observer,
         )
     };
 
@@ -827,7 +838,7 @@ impl RowGroupDecoder {
         });
 
         let task_handles = {
-            parallelize_first_to_local(
+            parallelize_first_to_local_observed(
                 TaskPriority::Low,
                 (0..n_items).step_by(cols_per_thread).map(move |offset| {
                     let items = items.clone();
@@ -839,6 +850,7 @@ impl RowGroupDecoder {
                             .collect::<PolarsResult<UnitVec<_>>>()
                     }
                 }),
+                self.decode_observer.as_ref(),
             )
         };
 
@@ -856,7 +868,13 @@ impl RowGroupDecoder {
         mask: &BooleanChunked,
     ) -> PolarsResult<Vec<(Source, Column)>> {
         let (sources, columns): (Vec<Source>, Vec<Column>) = live_columns.into_iter().unzip();
-        let columns = filter_cols(columns, mask, self.target_values_per_thread).await?;
+        let columns = filter_cols(
+            columns,
+            mask,
+            self.target_values_per_thread,
+            self.decode_observer.as_ref(),
+        )
+        .await?;
         Ok(sources.into_iter().zip(columns).collect())
     }
 }

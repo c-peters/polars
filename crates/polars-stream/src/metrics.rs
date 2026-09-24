@@ -32,6 +32,12 @@ pub struct NodeMetrics {
     pub io_total_bytes_received: u64,
     pub io_total_bytes_sent: u64,
 
+    /// How much decode time has already been folded into `total_poll_time_ns`.
+    /// `IOMetrics` is cumulative and re-read on every flush, so only the delta
+    /// may be added -- unlike the `io_total_*` fields, the poll totals are
+    /// accumulated from drained task metrics and must not be reset.
+    io_decode_applied_poll_ns: u64,
+
     pub state_update_in_progress: bool,
     pub num_running_tasks: u32,
     pub done: bool,
@@ -53,6 +59,21 @@ impl NodeMetrics {
         self.io_total_bytes_requested += io_metrics.bytes_requested.load();
         self.io_total_bytes_received += io_metrics.bytes_received.load();
         self.io_total_bytes_sent += io_metrics.bytes_sent.load();
+
+        // A detached decode task is one of this node's tasks that happens to
+        // carry no node key, so its metrics belong in the same counters
+        // `add_task` feeds -- same unit, same meaning. Folding them here rather
+        // than exposing them separately means every consumer of
+        // `total_poll_time_ns` sees a scan's real CPU with no schema change.
+        //
+        // Only the delta: cumulative and re-read on every flush.
+        //
+        // Poll time only. `total_polls`, `total_stolen_polls` and
+        // `max_poll_time_ns` deliberately still count streaming polls alone, so
+        // on a scan the time and the count describe different populations.
+        let poll_ns = io_metrics.decode_task_poll_ns.load();
+        self.total_poll_time_ns += poll_ns.saturating_sub(self.io_decode_applied_poll_ns);
+        self.io_decode_applied_poll_ns = poll_ns;
     }
 
     fn reset_io_metrics(&mut self) {
@@ -60,6 +81,9 @@ impl NodeMetrics {
         self.io_total_bytes_requested = 0;
         self.io_total_bytes_received = 0;
         self.io_total_bytes_sent = 0;
+        // Deliberately not the decode fold: it lives in the poll totals, which
+        // accumulate rather than being recomputed, and `add_io` re-applies only
+        // the delta.
     }
 
     fn start_state_update(&mut self) {
@@ -167,6 +191,41 @@ impl GraphMetrics {
 
     pub fn iter(&self) -> slotmap::secondary::Iter<'_, GraphNodeKey, NodeMetrics> {
         self.node_metrics.iter()
+    }
+}
+
+/// Routes a spawned column-decode task's metrics onto its scan node's `IOMetrics`.
+///
+/// `row_group_decode` fans column decoding out with `parallelize_first_to_local`,
+/// which runs the first chunk inline and spawns the rest. The inline chunk lands
+/// in the parent decode task's poll time; the spawned ones are detached and reach
+/// nothing. Handing this down puts them on the same node as the parent.
+///
+/// The two chunking rules differ, and only one is governed by the tuning target:
+///
+///   - unfiltered: `calc_cols_per_thread` chunks once a row group's projected
+///     cell count passes `target_values_per_thread` (16Mi), i.e. above ~64
+///     projected columns for polars-written files and ~16 for pyarrow's defaults
+///   - prefiltered, i.e. any scan with a pushed-down predicate: chunks columns
+///     across `num_pipelines` unconditionally, ignoring the target
+///
+/// So a filtered scan always fans out, whatever the row group geometry, and
+/// attributing only the parent under-reports those substantially.
+///
+/// This path is more exposed to the executor's record-after-`run` race than the
+/// parent is (see `await_decode`). A chunk future contains no `.await`, so it is
+/// polled exactly once; `run` wakes the joining parent from inside itself, and
+/// the executor adds the poll's time only after `run` returns. If the parent
+/// wins that window the chunk folds in as zero -- losing all of it, not a
+/// fraction, and biased toward the chunk whose completion did the waking.
+/// Measured totals do not show it firing (forcing maximum fan-out reports the
+/// same CPU as forcing none), but the fix is the same one named on
+/// `await_decode`: record inside `run`, before the wake.
+pub struct DecodeTaskObserver(pub Arc<IOMetrics>);
+
+impl polars_async::executor::SpawnedTaskObserver for DecodeTaskObserver {
+    fn task_finished(&self, metrics: &TaskMetrics) {
+        OptIOMetrics(Some(self.0.clone())).add_decode_task(metrics.total_poll_time_ns.load());
     }
 }
 
