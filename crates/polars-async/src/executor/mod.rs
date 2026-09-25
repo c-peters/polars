@@ -16,7 +16,7 @@ use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, Location};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, LazyLock, OnceLock, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,8 @@ use crossbeam_utils::CachePadded;
 use numa::{NumaRegionId, cpu_idx_to_numa_region, num_numa_regions, pin_thread_to_numa_region};
 use park_group::ParkGroup;
 use parking_lot::Mutex;
+use polars_utils::cpu_time::thread_cpu_ns;
+use polars_utils::live_timer::LiveTimerSession;
 use polars_utils::relaxed_cell::RelaxedCell;
 use polars_utils::with_drop::WithDrop;
 use rand::rngs::SmallRng;
@@ -36,6 +38,13 @@ use task::{Cancellable, DynTask, Runnable};
 thread_local! {
     pub static ALLOW_RAYON_THREADS: Cell<bool> = const { Cell::new(true) };
     pub static THREAD_SPAWNED_BY_POLARS_EXECUTOR: Cell<bool> = const { Cell::new(false) };
+
+    /// Who to credit for tasks spawned from this thread right now.
+    ///
+    /// Set around a task's poll to that task's own attribution, so a task
+    /// spawned from inside another task inherits it, transitively and without
+    /// the spawning code having to know about metrics.
+    static TLS_ATTRIBUTION: Cell<Option<Arc<dyn TaskAttribution>>> = const { Cell::new(None) };
 
     /// Used to store which executor thread this is.
     static TLS_THREAD_ID: Cell<usize> = const { Cell::new(usize::MAX) };
@@ -52,6 +61,212 @@ static TRACK_METRICS: RelaxedCell<bool> = RelaxedCell::new_bool(false);
 
 pub fn track_task_metrics(should_track: bool) {
     TRACK_METRICS.store(should_track);
+}
+
+static TRACK_POLL_CPU: RelaxedCell<bool> = RelaxedCell::new_bool(false);
+
+/// Also measure each poll on the thread CPU clock, not only the wall clock.
+///
+/// Poll wall time counts time the thread was descheduled, so under
+/// oversubscription it can exceed the CPU the process actually used. The CPU
+/// clock does not, at the cost of an extra `clock_gettime` per poll -- a
+/// syscall on Linux -- which is why it is opt-in. Requires task metrics, and
+/// reports nothing on Windows, whose thread clock is too coarse for a poll.
+pub fn track_poll_cpu_time(should_track: bool) {
+    TRACK_POLL_CPU.store(should_track);
+}
+
+/// Receives the metrics of every task spawned on this attribution's behalf.
+///
+/// The executor is shared by every query in the process, so an implementor has
+/// to identify both the query and the node within it; a bare node key is not
+/// enough.
+pub trait TaskAttribution: Send + Sync + 'static {
+    /// Called once per spawn, before the task is first polled.
+    ///
+    /// The metrics are live and keep updating, so the implementor holds the
+    /// `Arc` and reads it later rather than reading it here.
+    fn task_spawned(&self, metrics: &Arc<TaskMetrics>);
+
+    /// Opens a session for the duration of one poll.
+    ///
+    /// Summing poll time counts eight threads polling for a millisecond as
+    /// eight milliseconds -- right for cost, wrong for duration. Unioning the
+    /// sessions instead gives the one millisecond they occupied.
+    fn poll_session(&self) -> Option<LiveTimerSession> {
+        None
+    }
+}
+
+/// Where an executor thread's wall time went.
+///
+/// A worker is in exactly one of these at any instant, so summed over threads
+/// they partition `num_threads * wall`. A residual in that sum is work no
+/// counter sees.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkerStateTimes {
+    /// Running task futures.
+    pub poll_ns: u64,
+    /// Looking for a task: the local slot, the local queue, stealing, unparking.
+    pub overhead_ns: u64,
+    /// Asleep with nothing to do.
+    pub parked_ns: u64,
+    /// Thread CPU across those polls, when [`track_poll_cpu_time`] is on.
+    ///
+    /// Excludes time the thread was descheduled, so the gap below `poll_ns` is
+    /// the cost of oversubscription.
+    pub poll_cpu_ns: u64,
+    /// Part of `poll_ns` belonging to tasks no attribution claimed.
+    ///
+    /// Should be near zero. Anything else is work the per-node metrics cannot
+    /// see, usually a spawn that crossed onto another runtime without
+    /// [`with_current_attribution`].
+    pub unattributed_poll_ns: u64,
+}
+
+impl WorkerStateTimes {
+    /// The three states a thread can be in. `unattributed_poll_ns` is a subset
+    /// of `poll_ns`, so it is deliberately not part of the sum.
+    pub fn total_ns(&self) -> u64 {
+        self.poll_ns + self.overhead_ns + self.parked_ns
+    }
+
+    /// What this thread accumulated since `earlier`.
+    pub fn since(&self, earlier: &Self) -> Self {
+        Self {
+            poll_ns: self.poll_ns.saturating_sub(earlier.poll_ns),
+            overhead_ns: self.overhead_ns.saturating_sub(earlier.overhead_ns),
+            parked_ns: self.parked_ns.saturating_sub(earlier.parked_ns),
+            poll_cpu_ns: self.poll_cpu_ns.saturating_sub(earlier.poll_cpu_ns),
+            unattributed_poll_ns: self
+                .unattributed_poll_ns
+                .saturating_sub(earlier.unattributed_poll_ns),
+        }
+    }
+}
+
+/// One worker's counters, written only by that worker and read by anyone.
+///
+/// Cache-line aligned and single-writer, so writes never contend; readers take
+/// a relaxed load and may see a slightly stale value.
+#[derive(Default)]
+#[repr(align(128))]
+struct WorkerStateCounters {
+    poll_ns: RelaxedCell<u64>,
+    overhead_ns: RelaxedCell<u64>,
+    parked_ns: RelaxedCell<u64>,
+    poll_cpu_ns: RelaxedCell<u64>,
+    unattributed_poll_ns: RelaxedCell<u64>,
+}
+
+impl WorkerStateCounters {
+    fn read(&self) -> WorkerStateTimes {
+        WorkerStateTimes {
+            poll_ns: self.poll_ns.load(),
+            overhead_ns: self.overhead_ns.load(),
+            parked_ns: self.parked_ns.load(),
+            poll_cpu_ns: self.poll_cpu_ns.load(),
+            unattributed_poll_ns: self.unattributed_poll_ns.load(),
+        }
+    }
+}
+
+/// Every worker that has ever run, so their counters can be summed.
+///
+/// Threads are never removed: a runner that gives up its identity may come
+/// back, and its totals have to survive in either case.
+static WORKER_STATES: LazyLock<Mutex<Vec<Arc<WorkerStateCounters>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+thread_local! {
+    static TLS_WORKER_STATE: Arc<WorkerStateCounters> = {
+        let counters = Arc::<WorkerStateCounters>::default();
+        WORKER_STATES.lock().push(Arc::clone(&counters));
+        counters
+    };
+}
+
+/// Sums every executor thread's state times.
+///
+/// Process-wide and cumulative: for one query's share, snapshot before and
+/// after and use [`WorkerStateTimes::since`]. That is exact only when the query
+/// had the executor to itself, not when queries run concurrently.
+pub fn worker_state_times() -> WorkerStateTimes {
+    let mut total = WorkerStateTimes::default();
+    for counters in WORKER_STATES.lock().iter() {
+        let t = counters.read();
+        total.poll_ns += t.poll_ns;
+        total.overhead_ns += t.overhead_ns;
+        total.parked_ns += t.parked_ns;
+        total.poll_cpu_ns += t.poll_cpu_ns;
+        total.unattributed_poll_ns += t.unattributed_poll_ns;
+    }
+    total
+}
+
+/// Carries the current attribution into a future that will run elsewhere.
+///
+/// Inheritance rides a thread-local that only this executor's runner sets, so
+/// it does not survive a hop onto another runtime: a task spawned from inside
+/// an `ASYNC.spawn` future would start unattributed. This captures the
+/// attribution while it is still in scope and reinstalls it around each poll.
+pub fn with_current_attribution<F: Future>(fut: F) -> AttributedFuture<F> {
+    AttributedFuture {
+        attribution: current_task_attribution(),
+        fut,
+    }
+}
+
+pin_project_lite::pin_project! {
+    pub struct AttributedFuture<F> {
+        attribution: Option<Arc<dyn TaskAttribution>>,
+        #[pin]
+        fut: F,
+    }
+}
+
+impl<F: Future> Future for AttributedFuture<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let _guard = scoped_task_attribution(this.attribution.clone());
+        this.fut.poll(cx)
+    }
+}
+
+/// Metrics for a task about to be spawned, registered with its attribution.
+fn new_task_metrics(attribution: Option<&Arc<dyn TaskAttribution>>) -> Option<Arc<TaskMetrics>> {
+    let metrics: Option<Arc<TaskMetrics>> = TRACK_METRICS.load().then(Arc::default);
+    if let Some((attribution, metrics)) = attribution.zip(metrics.as_ref()) {
+        attribution.task_spawned(metrics);
+    }
+    metrics
+}
+
+/// Restores the previous attribution when dropped.
+#[must_use = "dropping the guard immediately restores the previous attribution"]
+pub struct AttributionGuard(Option<Arc<dyn TaskAttribution>>);
+
+impl Drop for AttributionGuard {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        TLS_ATTRIBUTION.with(|slot| slot.set(previous));
+    }
+}
+
+/// Credits tasks spawned from this thread to `attribution` until the guard drops.
+pub fn scoped_task_attribution(attribution: Option<Arc<dyn TaskAttribution>>) -> AttributionGuard {
+    AttributionGuard(TLS_ATTRIBUTION.with(|slot| slot.replace(attribution)))
+}
+
+fn current_task_attribution() -> Option<Arc<dyn TaskAttribution>> {
+    // `Cell` cannot lend a reference, so take and put back.
+    TLS_ATTRIBUTION.with(|slot| {
+        let current = slot.take();
+        slot.set(current.clone());
+        current
+    })
 }
 
 static GLOBAL_SCHEDULER: OnceLock<Executor> = OnceLock::new();
@@ -80,6 +295,9 @@ pub struct TaskMetrics {
     pub total_stolen_polls: RelaxedCell<u64>,
     pub total_poll_time_ns: RelaxedCell<u64>,
     pub max_poll_time_ns: RelaxedCell<u64>,
+    /// Thread CPU consumed by this task's polls, when
+    /// [`track_poll_cpu_time`] is on. Zero otherwise, and on Windows.
+    pub total_poll_cpu_time_ns: RelaxedCell<u64>,
     pub done: RelaxedCell<bool>,
 }
 
@@ -89,6 +307,9 @@ struct TaskMetadata {
     freshly_spawned: AtomicBool,
     scoped: Option<ScopedTaskMetadata>,
     metrics: Option<Arc<TaskMetrics>>,
+    /// Inherited at spawn; installed while this task is polled so that anything
+    /// it spawns is credited to the same place.
+    attribution: Option<Arc<dyn TaskAttribution>>,
 }
 
 impl Drop for TaskMetadata {
@@ -333,6 +554,12 @@ impl Executor {
 
         let mut rng = SmallRng::from_rng(&mut rand::rng());
         let mut worker = self.park_groups[numa_region.0].new_worker();
+        // Fetched once, and only if metrics are ever on: touching the
+        // thread-local registers this thread in a process-wide list that is
+        // never pruned, and runners are created and destroyed dynamically by
+        // `block_in_place`. Registering unconditionally would grow that list
+        // for the lifetime of a process that never asked for metrics.
+        let mut worker_state: Option<Arc<WorkerStateCounters>> = None;
 
         loop {
             // If we're a runner without an assigned thread id, get one.
@@ -348,6 +575,13 @@ impl Executor {
 
             let ttl = &self.thread_task_lists[thread_id];
             let mut local = true;
+            // Time between polls is either looking for work or sleeping; the
+            // closure reports how much of it was spent asleep.
+            let track_states = TRACK_METRICS.load();
+            let worker_state: Option<&WorkerStateCounters> = track_states
+                .then(|| &**worker_state.get_or_insert_with(|| TLS_WORKER_STATE.with(Arc::clone)));
+            let fetch_start = track_states.then(Instant::now);
+            let mut parked_ns = 0u64;
             let task = (|| {
                 // Try to get a task from LIFO slot.
                 if let Some(task) = unsafe { (*ttl.local_slot.get()).take() } {
@@ -371,9 +605,23 @@ impl Executor {
                     return Some(task);
                 }
 
+                let park_start = track_states.then(Instant::now);
                 park.park();
+                if let Some(park_start) = park_start {
+                    parked_ns = park_start.elapsed().as_nanos() as u64;
+                }
                 None
             })();
+
+            if let Some((fetch_start, worker_state)) = fetch_start.zip(worker_state) {
+                let elapsed_ns = fetch_start.elapsed().as_nanos() as u64;
+                worker_state
+                    .overhead_ns
+                    .fetch_add(elapsed_ns.saturating_sub(parked_ns));
+                if parked_ns != 0 {
+                    worker_state.parked_ns.fetch_add(parked_ns);
+                }
+            }
 
             if let Some(task) = task {
                 // Try to recruit another worker, and if there's no idle workers
@@ -382,17 +630,53 @@ impl Executor {
                     self.unpark_one_worker_random_numa_region();
                 }
 
-                if let Some(metrics) = task.metadata().metrics.clone() {
+                if track_states {
+                    // Read before running: `run` consumes the task.
+                    let metrics = task.metadata().metrics.clone();
+                    let attribution = task.metadata().attribution.clone();
+                    let had_attribution = attribution.is_some();
+
+                    // Held across the poll: the union of these sessions is how
+                    // long the node was occupied, as opposed to how much thread
+                    // time it used.
+                    let _occupancy = attribution.as_ref().and_then(|a| a.poll_session());
+                    // Anything this task spawns inherits its attribution.
+                    let _attribution = scoped_task_attribution(attribution);
+
+                    let cpu_start = TRACK_POLL_CPU.load().then(thread_cpu_ns).flatten();
                     let start = Instant::now();
                     task.run();
                     let elapsed_ns = start.elapsed().as_nanos() as u64;
-                    metrics.total_polls.fetch_add(1);
-                    if !local {
-                        metrics.total_stolen_polls.fetch_add(1);
+                    // Lazily: `Option::zip` would read the clock on every poll
+                    // even with CPU tracking off.
+                    let cpu_ns = cpu_start.map_or(0, |before| {
+                        thread_cpu_ns().map_or(0, |after| after.saturating_sub(before))
+                    });
+
+                    // Per thread as well as per task: a task with no metrics
+                    // still occupies the thread.
+                    if let Some(worker_state) = worker_state {
+                        worker_state.poll_ns.fetch_add(elapsed_ns);
+                        if cpu_ns != 0 {
+                            worker_state.poll_cpu_ns.fetch_add(cpu_ns);
+                        }
+                        if !had_attribution {
+                            worker_state.unattributed_poll_ns.fetch_add(elapsed_ns);
+                        }
                     }
-                    metrics.total_poll_time_ns.fetch_add(elapsed_ns);
-                    metrics.max_poll_time_ns.fetch_max(elapsed_ns);
+
+                    if let Some(metrics) = metrics {
+                        metrics.total_polls.fetch_add(1);
+                        if !local {
+                            metrics.total_stolen_polls.fetch_add(1);
+                        }
+                        metrics.total_poll_time_ns.fetch_add(elapsed_ns);
+                        metrics.total_poll_cpu_time_ns.fetch_add(cpu_ns);
+                        metrics.max_poll_time_ns.fetch_max(elapsed_ns);
+                    }
                 } else {
+                    // No guard: an attribution can only reach a task through
+                    // `GraphMetrics`, which only exists when metrics are on.
                     task.run();
                 }
             }
@@ -526,8 +810,13 @@ impl<'scope> TaskScope<'scope, '_> {
 
         let mut runnable = None;
         let mut join_handle = None;
+        // Hoisted out of `insert_with_key`: neither depends on the task key,
+        // and `task_spawned` takes the graph-wide metrics lock, which must not
+        // nest inside `cancel_handles`.
+        let attribution = current_task_attribution();
+        let metrics = new_task_metrics(attribution.as_ref());
+
         self.cancel_handles.lock().insert_with_key(|task_key| {
-            let metrics = TRACK_METRICS.load().then(Arc::default);
             let dyn_task = unsafe {
                 // SAFETY: we make sure to cancel this task before 'scope ends.
                 let executor = Executor::global();
@@ -544,6 +833,7 @@ impl<'scope> TaskScope<'scope, '_> {
                             completed_tasks: Arc::downgrade(&self.completed_tasks),
                         }),
                         metrics,
+                        attribution,
                     },
                 )
             };
@@ -591,7 +881,8 @@ where
     let spawn_location = Location::caller();
     let executor = Executor::global();
     let on_wake = move |task| executor.schedule_task(task);
-    let metrics = TRACK_METRICS.load().then(Arc::default);
+    let attribution = current_task_attribution();
+    let metrics = new_task_metrics(attribution.as_ref());
     let dyn_task = task::spawn(
         fut,
         on_wake,
@@ -601,6 +892,7 @@ where
             freshly_spawned: AtomicBool::new(true),
             scoped: None,
             metrics,
+            attribution,
         },
     );
     Arc::clone(&dyn_task).schedule();
