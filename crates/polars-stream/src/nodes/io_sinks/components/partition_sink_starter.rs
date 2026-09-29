@@ -18,6 +18,7 @@ use crate::utils::tokio_handle_ext;
 
 #[derive(Clone)]
 pub struct PartitionSinkStarter {
+    pub attribution: polars_async::executor::TaskAttributionHandle,
     pub file_provider: Arc<FileProvider>,
     pub writer_starter: Arc<dyn FileWriterStarter>,
     pub sync_on_close: SyncOnCloseType,
@@ -46,15 +47,17 @@ impl PartitionSinkStarter {
         let (morsel_tx, morsel_rx) = connector::connector();
 
         let writer_handle = self.writer_starter.start_file_writer(
+            self.attribution.clone(),
             morsel_rx,
             FileOpenTaskHandle::new(file_open_task, self.sync_on_close),
             self.num_pipelines_per_sink,
         )?;
 
-        let task_handle = executor::spawn(TaskPriority::High, async move {
-            writer_handle.await?;
-            Ok(file_permit)
-        });
+        let task_handle =
+            executor::spawn(TaskPriority::High, self.attribution.clone(), async move {
+                writer_handle.await?;
+                Ok(file_permit)
+            });
 
         Ok(FileSinkTaskData::new(
             morsel_tx,

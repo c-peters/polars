@@ -79,6 +79,7 @@ impl StatisticsColumns {
 }
 
 pub(super) async fn calculate_row_group_pred_pushdown_skip_mask(
+    attribution: polars_async::executor::TaskAttributionHandle,
     row_group_slice: Range<usize>,
     use_statistics: bool,
     predicate: Option<&ScanIOPredicate>,
@@ -98,6 +99,7 @@ pub(super) async fn calculate_row_group_pred_pushdown_skip_mask(
     let static_mask = match predicate.skip_batch_predicate.as_ref() {
         Some(sbp) => {
             static_skip_mask(
+                attribution,
                 row_group_slice.clone(),
                 sbp.clone(),
                 predicate.live_columns.clone(),
@@ -138,6 +140,7 @@ pub(super) async fn calculate_row_group_pred_pushdown_skip_mask(
 }
 
 async fn static_skip_mask(
+    attribution: polars_async::executor::TaskAttributionHandle,
     row_group_slice: Range<usize>,
     sbp: Arc<dyn polars_io::predicates::SkipBatchPredicate>,
     skip_batch_columns: Arc<PlIndexSet<PlSmallStr>>,
@@ -150,58 +153,59 @@ async fn static_skip_mask(
 
     // Note: We are spawning here onto the computational async runtime because the caller is being run
     // on a tokio async thread.
-    let skip_row_group_mask = executor::spawn(TaskPriority::High, async move {
-        let row_groups_slice = &metadata.row_groups[row_group_slice.clone()];
+    let skip_row_group_mask =
+        executor::spawn(TaskPriority::High, attribution.clone(), async move {
+            let row_groups_slice = &metadata.row_groups[row_group_slice.clone()];
 
-        if let Some(ri) = &mut row_index {
-            for md in metadata.row_groups[0..row_group_slice.start].iter() {
-                ri.offset = ri
-                    .offset
-                    .saturating_add(IdxSize::try_from(md.num_rows()).unwrap_or(IdxSize::MAX));
-            }
-        }
-
-        let mut columns = Vec::with_capacity(1 + skip_batch_columns.len() * 3);
-
-        let lengths: Vec<IdxSize> = row_groups_slice
-            .iter()
-            .map(|rg| rg.num_rows() as IdxSize)
-            .collect();
-
-        columns.push(Column::new("len".into(), lengths));
-
-        for projection in projected_arrow_fields.iter() {
-            let c = projection.output_name();
-
-            if !skip_batch_columns.contains(c) {
-                continue;
+            if let Some(ri) = &mut row_index {
+                for md in metadata.row_groups[0..row_group_slice.start].iter() {
+                    ri.offset = ri
+                        .offset
+                        .saturating_add(IdxSize::try_from(md.num_rows()).unwrap_or(IdxSize::MAX));
+                }
             }
 
-            let mut statistics =
-                load_parquet_column_statistics(&metadata, row_group_slice.clone(), projection)?;
+            let mut columns = Vec::with_capacity(1 + skip_batch_columns.len() * 3);
 
-            // Note: Order is important here. We re-use the transform for the output column, meaning
-            // that it may set the column name.
-            statistics.min = projection.apply_transform(statistics.min)?;
-            statistics.max = projection.apply_transform(statistics.max)?;
+            let lengths: Vec<IdxSize> = row_groups_slice
+                .iter()
+                .map(|rg| rg.num_rows() as IdxSize)
+                .collect();
 
-            let statistics = statistics.with_base_column_name(c);
+            columns.push(Column::new("len".into(), lengths));
 
-            columns.extend([statistics.min, statistics.max, statistics.null_count]);
-        }
+            for projection in projected_arrow_fields.iter() {
+                let c = projection.output_name();
 
-        if let Some(row_index) = row_index {
-            let statistics = build_row_index_statistics(&row_index, row_groups_slice)
-                .with_base_column_name(&row_index.name);
+                if !skip_batch_columns.contains(c) {
+                    continue;
+                }
 
-            columns.extend([statistics.min, statistics.max, statistics.null_count]);
-        }
+                let mut statistics =
+                    load_parquet_column_statistics(&metadata, row_group_slice.clone(), projection)?;
 
-        let statistics_df = DataFrame::new(num_row_groups, columns)?;
+                // Note: Order is important here. We re-use the transform for the output column, meaning
+                // that it may set the column name.
+                statistics.min = projection.apply_transform(statistics.min)?;
+                statistics.max = projection.apply_transform(statistics.max)?;
 
-        sbp.evaluate_with_stat_df(&statistics_df)
-    })
-    .await?;
+                let statistics = statistics.with_base_column_name(c);
+
+                columns.extend([statistics.min, statistics.max, statistics.null_count]);
+            }
+
+            if let Some(row_index) = row_index {
+                let statistics = build_row_index_statistics(&row_index, row_groups_slice)
+                    .with_base_column_name(&row_index.name);
+
+                columns.extend([statistics.min, statistics.max, statistics.null_count]);
+            }
+
+            let statistics_df = DataFrame::new(num_row_groups, columns)?;
+
+            sbp.evaluate_with_stat_df(&statistics_df)
+        })
+        .await?;
 
     Ok(Some(skip_row_group_mask))
 }

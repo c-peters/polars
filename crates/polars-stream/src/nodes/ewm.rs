@@ -50,32 +50,36 @@ impl ComputeNode for EwmNode {
         let mut recv = recv_ports[0].take().unwrap().serial();
         let mut send = send_ports[0].take().unwrap().serial();
 
-        join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-            while let Ok(mut morsel) = recv.recv().await {
-                let mut df = morsel.df_mut().await;
+        join_handles.push(scope.spawn_task(
+            TaskPriority::High,
+            _state.attribution.clone(),
+            async move {
+                while let Ok(mut morsel) = recv.recv().await {
+                    let mut df = morsel.df_mut().await;
 
-                debug_assert_eq!(df.width(), 1);
+                    debug_assert_eq!(df.width(), 1);
 
-                unsafe {
-                    let c = df.columns_mut_retain_schema().get_mut(0).unwrap();
+                    unsafe {
+                        let c = df.columns_mut_retain_schema().get_mut(0).unwrap();
 
-                    *c = Series::from_chunks_and_dtype_unchecked(
-                        c.name().clone(),
-                        vec![self.state.ewm_state_update(
-                            c.as_materialized_series().rechunk().chunks()[0].as_ref(),
-                        )],
-                        c.dtype(),
-                    )
-                    .into_column()
+                        *c = Series::from_chunks_and_dtype_unchecked(
+                            c.name().clone(),
+                            vec![self.state.ewm_state_update(
+                                c.as_materialized_series().rechunk().chunks()[0].as_ref(),
+                            )],
+                            c.dtype(),
+                        )
+                        .into_column()
+                    }
+                    drop(df);
+
+                    if send.send(morsel).await.is_err() {
+                        break;
+                    }
                 }
-                drop(df);
 
-                if send.send(morsel).await.is_err() {
-                    break;
-                }
-            }
-
-            Ok(())
-        }));
+                Ok(())
+            },
+        ));
     }
 }

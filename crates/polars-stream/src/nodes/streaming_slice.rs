@@ -50,49 +50,54 @@ impl ComputeNode for StreamingSliceNode {
         assert!(recv_ports.len() == 1 && send_ports.len() == 1);
         let mut recv = recv_ports[0].take().unwrap().serial();
         let mut send = send_ports[0].take().unwrap().serial();
-        join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-            let stop_offset = self.start_offset.saturating_add(self.length);
+        join_handles.push(scope.spawn_task(
+            TaskPriority::High,
+            _state.attribution.clone(),
+            async move {
+                let stop_offset = self.start_offset.saturating_add(self.length);
 
-            while let Ok(morsel) = recv.recv().await {
-                let morsel = morsel
-                    .map(|df| {
-                        let height = df.height();
+                while let Ok(morsel) = recv.recv().await {
+                    let morsel = morsel
+                        .map(|df| {
+                            let height = df.height();
 
-                        // Calculate start/stop offsets within df and update global offset.
-                        let relative_start_offset = self
-                            .start_offset
-                            .saturating_sub(self.stream_offset)
-                            .min(height);
-                        let relative_stop_offset =
-                            stop_offset.saturating_sub(self.stream_offset).min(height);
-                        self.stream_offset += height;
+                            // Calculate start/stop offsets within df and update global offset.
+                            let relative_start_offset = self
+                                .start_offset
+                                .saturating_sub(self.stream_offset)
+                                .min(height);
+                            let relative_stop_offset =
+                                stop_offset.saturating_sub(self.stream_offset).min(height);
+                            self.stream_offset += height;
 
-                        let new_height = relative_stop_offset.saturating_sub(relative_start_offset);
-                        if new_height != height {
-                            df.slice(relative_start_offset as i64, new_height)
-                        } else {
-                            df
-                        }
-                    })
-                    .await;
+                            let new_height =
+                                relative_stop_offset.saturating_sub(relative_start_offset);
+                            if new_height != height {
+                                df.slice(relative_start_offset as i64, new_height)
+                            } else {
+                                df
+                            }
+                        })
+                        .await;
 
-                // Technically not necessary, but it's nice to already tell the
-                // source to stop producing more morsels as we won't be
-                // interested in the results anyway.
-                if self.stream_offset >= stop_offset {
-                    morsel.source_token().stop();
+                    // Technically not necessary, but it's nice to already tell the
+                    // source to stop producing more morsels as we won't be
+                    // interested in the results anyway.
+                    if self.stream_offset >= stop_offset {
+                        morsel.source_token().stop();
+                    }
+
+                    if morsel.height() > 0 && send.send(morsel).await.is_err() {
+                        break;
+                    }
+
+                    if self.stream_offset >= stop_offset {
+                        break;
+                    }
                 }
 
-                if morsel.height() > 0 && send.send(morsel).await.is_err() {
-                    break;
-                }
-
-                if self.stream_offset >= stop_offset {
-                    break;
-                }
-            }
-
-            Ok(())
-        }))
+                Ok(())
+            },
+        ))
     }
 }

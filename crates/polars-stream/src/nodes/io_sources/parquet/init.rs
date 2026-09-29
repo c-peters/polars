@@ -47,6 +47,7 @@ impl ParquetReadImpl {
     /// Constructs the task that distributes morsels across the engine pipelines.
     #[allow(clippy::type_complexity)]
     pub(super) fn init_morsel_distributor(&mut self) -> AsyncTaskData {
+        let attribution = self.attribution.clone();
         let verbose = self.verbose;
         let use_statistics = self.options.use_statistics;
 
@@ -116,6 +117,7 @@ impl ParquetReadImpl {
         let rg_prefetch_current_all_spawned =
             Option::take(&mut self.rg_prefetch_current_all_spawned);
 
+        let prefetch_attribution = attribution.clone();
         let prefetch_task = AbortOnDropHandle(ASYNC.spawn(async move {
             polars_ensure!(
                 metadata.num_rows < IdxSize::MAX as usize,
@@ -172,6 +174,7 @@ impl ParquetReadImpl {
             }
 
             let row_group_mask = calculate_row_group_pred_pushdown_skip_mask(
+                prefetch_attribution.clone(),
                 row_group_slice.clone(),
                 use_statistics,
                 predicate.as_ref(),
@@ -225,20 +228,21 @@ impl ParquetReadImpl {
         // Decode loop (spawns decodes on the computational executor).
         let (decode_send, mut decode_recv) = tokio::sync::mpsc::channel(self.config.num_pipelines);
         // Preserve scan attribution across Tokio before spawning executor tasks.
-        let decode_task =
-            AbortOnDropHandle(ASYNC.spawn(executor::with_current_attribution(async move {
-                while let Some((prefetch_task, permits)) = prefetch_recv.recv().await {
-                    let row_group_data = prefetch_task.await.unwrap()?;
-                    let row_group_decoder = row_group_decoder.clone();
-                    let decode_fut = executor::spawn(TaskPriority::High, async move {
+        let decode_attribution = attribution.clone();
+        let decode_task = AbortOnDropHandle(ASYNC.spawn(async move {
+            while let Some((prefetch_task, permits)) = prefetch_recv.recv().await {
+                let row_group_data = prefetch_task.await.unwrap()?;
+                let row_group_decoder = row_group_decoder.clone();
+                let decode_fut =
+                    executor::spawn(TaskPriority::High, decode_attribution.clone(), async move {
                         row_group_decoder.row_group_data_to_df(row_group_data).await
                     });
-                    if decode_send.send((decode_fut, permits)).await.is_err() {
-                        break;
-                    }
+                if decode_send.send((decode_fut, permits)).await.is_err() {
+                    break;
                 }
-                PolarsResult::Ok(())
-            })));
+            }
+            PolarsResult::Ok(())
+        }));
 
         // Distributes morsels across pipelines. This does not perform any CPU or I/O bound work -
         // it is purely a dispatch loop. Run on the computational executor to reduce context switches.
@@ -247,86 +251,87 @@ impl ParquetReadImpl {
         // is shared across files in the scan.
         let last_morsel_pipelines = self.config.last_morsel_pipelines;
         let disable_morsel_split = self.disable_morsel_split;
-        let distribute_task = executor::spawn(TaskPriority::High, async move {
-            let mut morsel_seq = MorselSeq::default();
-            // Note: We don't use this (it is handled by the bridge). But morsels require a source token.
-            let source_token = SourceToken::new();
+        let distribute_task =
+            executor::spawn(TaskPriority::High, attribution.clone(), async move {
+                let mut morsel_seq = MorselSeq::default();
+                // Note: We don't use this (it is handled by the bridge). But morsels require a source token.
+                let source_token = SourceToken::new();
 
-            // Decode first non-empty morsel.
-            let mut next = None;
-            loop {
-                let Some((decode_fut, permits)) = decode_recv.recv().await else {
-                    break;
-                };
-                let df = decode_fut.await?;
-                if df.height() == 0 {
-                    continue;
-                }
-
-                if disable_morsel_split {
-                    if morsel_sender
-                        .send_morsel(Morsel::new_unregistered(
-                            df,
-                            morsel_seq,
-                            source_token.clone(),
-                        ))
-                        .await
-                        .is_err()
-                    {
-                        return Ok(());
-                    }
-                    drop(permits);
-                    morsel_seq = morsel_seq.successor();
-                    continue;
-                }
-
-                next = Some((df, permits));
-                break;
-            }
-
-            while let Some((df, permits)) = next.take() {
-                // Try to decode the next non-empty morsel first, so we know
-                // whether the df is the last morsel.
-
-                // Important: Drop this before awaiting the next one, or could
-                // deadlock if the permit limit is 1.
-                drop(permits);
-
+                // Decode first non-empty morsel.
+                let mut next = None;
                 loop {
-                    let Some((decode_fut, permit)) = decode_recv.recv().await else {
+                    let Some((decode_fut, permits)) = decode_recv.recv().await else {
                         break;
                     };
-                    let next_df = decode_fut.await?;
-                    if next_df.height() == 0 {
+                    let df = decode_fut.await?;
+                    if df.height() == 0 {
                         continue;
                     }
-                    next = Some((next_df, permit));
+
+                    if disable_morsel_split {
+                        if morsel_sender
+                            .send_morsel(Morsel::new_unregistered(
+                                df,
+                                morsel_seq,
+                                source_token.clone(),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                        drop(permits);
+                        morsel_seq = morsel_seq.successor();
+                        continue;
+                    }
+
+                    next = Some((df, permits));
                     break;
                 }
 
-                for df in split_to_morsels(
-                    &df,
-                    ideal_morsel_size,
-                    next.is_none(),
-                    last_morsel_pipelines,
-                ) {
-                    if morsel_sender
-                        .send_morsel(Morsel::new_unregistered(
-                            df,
-                            morsel_seq,
-                            source_token.clone(),
-                        ))
-                        .await
-                        .is_err()
-                    {
-                        return Ok(());
-                    }
-                    morsel_seq = morsel_seq.successor();
-                }
-            }
+                while let Some((df, permits)) = next.take() {
+                    // Try to decode the next non-empty morsel first, so we know
+                    // whether the df is the last morsel.
 
-            PolarsResult::Ok(())
-        });
+                    // Important: Drop this before awaiting the next one, or could
+                    // deadlock if the permit limit is 1.
+                    drop(permits);
+
+                    loop {
+                        let Some((decode_fut, permit)) = decode_recv.recv().await else {
+                            break;
+                        };
+                        let next_df = decode_fut.await?;
+                        if next_df.height() == 0 {
+                            continue;
+                        }
+                        next = Some((next_df, permit));
+                        break;
+                    }
+
+                    for df in split_to_morsels(
+                        &df,
+                        ideal_morsel_size,
+                        next.is_none(),
+                        last_morsel_pipelines,
+                    ) {
+                        if morsel_sender
+                            .send_morsel(Morsel::new_unregistered(
+                                df,
+                                morsel_seq,
+                                source_token.clone(),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                        morsel_seq = morsel_seq.successor();
+                    }
+                }
+
+                PolarsResult::Ok(())
+            });
 
         let join_task = ASYNC.spawn(async move {
             prefetch_task.await.unwrap()?;
@@ -474,6 +479,7 @@ impl ParquetReadImpl {
         }
 
         RowGroupDecoder {
+            attribution: self.attribution.clone(),
             num_pipelines: self.config.num_pipelines,
             projected_arrow_fields,
             row_index,

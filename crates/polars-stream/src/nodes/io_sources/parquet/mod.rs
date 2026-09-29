@@ -227,6 +227,7 @@ impl FileReader for ParquetFileReader {
         let n_rows_in_file = self._n_rows_in_file()?;
 
         let single_morsel_height: Option<usize> = if let BeginReadArgs {
+            attribution: _,
             projection,
             row_index: None,
             pre_slice,
@@ -258,6 +259,7 @@ impl FileReader for ParquetFileReader {
         };
 
         let BeginReadArgs {
+            attribution,
             projection,
             row_index,
             pre_slice: pre_slice_arg,
@@ -314,7 +316,11 @@ impl FileReader for ParquetFileReader {
 
             return Ok((
                 rx,
-                executor::spawn(TaskPriority::Low, std::future::ready(Ok(()))),
+                executor::spawn(
+                    TaskPriority::Low,
+                    attribution.clone(),
+                    std::future::ready(Ok(())),
+                ),
             ));
         }
 
@@ -351,7 +357,7 @@ impl FileReader for ParquetFileReader {
         if let Some(single_morsel_height) = single_morsel_height {
             let (mut tx, rx) = FileReaderOutputSend::new_serial();
 
-            let handle = executor::spawn(TaskPriority::Low, async move {
+            let handle = executor::spawn(TaskPriority::Low, attribution.clone(), async move {
                 let _ = tx
                     .send_morsel(Morsel::new_unregistered(
                         DataFrame::empty_with_height(single_morsel_height),
@@ -384,6 +390,7 @@ impl FileReader for ParquetFileReader {
         let is_full_projection = projected_arrow_fields.len() == file_schema.len();
 
         let (output_recv, handle) = ParquetReadImpl {
+            attribution: attribution.clone(),
             projected_arrow_fields,
             is_full_projection,
             predicate,
@@ -418,7 +425,9 @@ impl FileReader for ParquetFileReader {
 
         Ok((
             output_recv,
-            executor::spawn(TaskPriority::Low, async move { handle.await.unwrap() }),
+            executor::spawn(TaskPriority::Low, attribution.clone(), async move {
+                handle.await.unwrap()
+            }),
         ))
     }
 
@@ -430,7 +439,10 @@ impl FileReader for ParquetFileReader {
         Ok(Some(self._file_arrow_schema().clone()))
     }
 
-    async fn n_rows_in_file(&mut self) -> PolarsResult<IdxSize> {
+    async fn n_rows_in_file(
+        &mut self,
+        _attribution: polars_async::executor::TaskAttributionHandle,
+    ) -> PolarsResult<IdxSize> {
         self._n_rows_in_file()
     }
 
@@ -440,6 +452,7 @@ impl FileReader for ParquetFileReader {
 
     async fn row_position_after_slice(
         &mut self,
+        _attribution: polars_async::executor::TaskAttributionHandle,
         pre_slice: Option<Slice>,
     ) -> PolarsResult<IdxSize> {
         self._row_position_after_slice(pre_slice)
@@ -485,6 +498,7 @@ type AsyncTaskData = (
 );
 
 struct ParquetReadImpl {
+    attribution: polars_async::executor::TaskAttributionHandle,
     projected_arrow_fields: Arc<[ArrowFieldProjection]>,
     is_full_projection: bool,
     predicate: Option<ScanIOPredicate>,

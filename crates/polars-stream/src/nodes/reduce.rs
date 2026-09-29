@@ -60,7 +60,7 @@ impl ReduceNode {
                     })
                     .collect();
 
-                scope.spawn_task(TaskPriority::High, async move {
+                scope.spawn_task(TaskPriority::High, state.attribution.clone(), async move {
                     let mut in_columns = Vec::new();
                     let mut in_column_refs = Vec::new();
                     while let Ok(morsel) = recv.recv().await {
@@ -88,34 +88,44 @@ impl ReduceNode {
             })
             .collect();
 
-        join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-            for task in parallel_tasks {
-                let local_reducers = task.await?;
-                for (r1, r2) in reductions.iter_mut().zip(local_reducers) {
-                    r1.resize(1);
-                    unsafe {
-                        r1.combine_subset(&*r2, &[0], &[0])?;
+        join_handles.push(scope.spawn_task(
+            TaskPriority::High,
+            state.attribution.clone(),
+            async move {
+                for task in parallel_tasks {
+                    let local_reducers = task.await?;
+                    for (r1, r2) in reductions.iter_mut().zip(local_reducers) {
+                        r1.resize(1);
+                        unsafe {
+                            r1.combine_subset(&*r2, &[0], &[0])?;
+                        }
                     }
                 }
-            }
 
-            Ok(())
-        }));
+                Ok(())
+            },
+        ));
     }
 
     fn spawn_source<'env, 's>(
+        attribution: polars_async::executor::TaskAttributionHandle,
         df: &'env mut Option<DataFrame>,
         scope: &'s TaskScope<'s, 'env>,
         send: SendPort<'_>,
         join_handles: &mut Vec<JoinHandle<PolarsResult<()>>>,
     ) {
         let mut send = send.serial();
-        join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-            let morsel =
-                Morsel::new_unregistered(df.take().unwrap(), MorselSeq::new(0), SourceToken::new());
-            let _ = send.send(morsel).await;
-            Ok(())
-        }));
+        join_handles.push(
+            scope.spawn_task(TaskPriority::High, attribution.clone(), async move {
+                let morsel = Morsel::new_unregistered(
+                    df.take().unwrap(),
+                    MorselSeq::new(0),
+                    SourceToken::new(),
+                );
+                let _ = send.send(morsel).await;
+                Ok(())
+            }),
+        );
     }
 }
 
@@ -202,7 +212,13 @@ impl ComputeNode for ReduceNode {
             ReduceState::Source(df) => {
                 assert!(recv_ports[0].is_none());
                 let send_port = send_ports[0].take().unwrap();
-                Self::spawn_source(df, scope, send_port, join_handles)
+                Self::spawn_source(
+                    state.attribution.clone(),
+                    df,
+                    scope,
+                    send_port,
+                    join_handles,
+                )
             },
             ReduceState::Done => unreachable!(),
         }

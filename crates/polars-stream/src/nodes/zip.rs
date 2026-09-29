@@ -162,6 +162,7 @@ impl ComputeNode for ZipNode {
         send: &mut [PortState],
         _state: &StreamingExecutionState,
     ) -> PolarsResult<()> {
+        self.spill_ctx.set_attribution(_state.attribution.clone());
         assert!(send.len() == 1);
         assert!(recv.len() == self.input_heads.len());
 
@@ -241,143 +242,153 @@ impl ComputeNode for ZipNode {
                 let mut serial_recv = recv_port.take()?.serial();
                 let (buf_send, buf_recv) =
                     tokio::sync::mpsc::channel(*DEFAULT_ZIP_HEAD_BUFFER_SIZE);
-                join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                    while let Ok(morsel) = serial_recv.recv().await {
-                        if buf_send.send(morsel).await.is_err() {
-                            break;
+                join_handles.push(scope.spawn_task(
+                    TaskPriority::High,
+                    _state.attribution.clone(),
+                    async move {
+                        while let Ok(morsel) = serial_recv.recv().await {
+                            if buf_send.send(morsel).await.is_err() {
+                                break;
+                            }
                         }
-                    }
-                    Ok(())
-                }));
+                        Ok(())
+                    },
+                ));
                 Some(buf_recv)
             })
             .collect_vec();
 
-        join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-            let mut out = Vec::new();
-            let source_token = SourceToken::new();
-            loop {
-                if source_token.stop_requested() {
-                    break;
-                }
+        join_handles.push(scope.spawn_task(
+            TaskPriority::High,
+            _state.attribution.clone(),
+            async move {
+                let mut out = Vec::new();
+                let source_token = SourceToken::new();
+                loop {
+                    if source_token.stop_requested() {
+                        break;
+                    }
 
-                // Fill input heads until they are ready to send or the input is
-                // exhausted (in this phase).
-                let mut all_ready = true;
-                for (recv_idx, opt_recv) in receivers.iter_mut().enumerate() {
-                    if let Some(recv) = opt_recv {
-                        while !self.input_heads[recv_idx].ready_to_send() {
-                            if let Some(morsel) = recv.recv().await {
-                                self.input_heads[recv_idx]
-                                    .add_morsel(morsel, &self.spill_ctx)
-                                    .await;
-                            } else {
-                                break;
+                    // Fill input heads until they are ready to send or the input is
+                    // exhausted (in this phase).
+                    let mut all_ready = true;
+                    for (recv_idx, opt_recv) in receivers.iter_mut().enumerate() {
+                        if let Some(recv) = opt_recv {
+                            while !self.input_heads[recv_idx].ready_to_send() {
+                                if let Some(morsel) = recv.recv().await {
+                                    self.input_heads[recv_idx]
+                                        .add_morsel(morsel, &self.spill_ctx)
+                                        .await;
+                                } else {
+                                    break;
+                                }
                             }
                         }
+                        all_ready &= self.input_heads[recv_idx].ready_to_send();
                     }
-                    all_ready &= self.input_heads[recv_idx].ready_to_send();
-                }
 
-                if !all_ready {
-                    // One or more of the input heads is exhausted (this phase).
-                    break;
-                }
+                    if !all_ready {
+                        // One or more of the input heads is exhausted (this phase).
+                        break;
+                    }
 
-                // TODO: recombine morsels to make sure the concatenation is
-                // close to the ideal morsel size.
+                    // TODO: recombine morsels to make sure the concatenation is
+                    // close to the ideal morsel size.
 
-                let mut should_break = false;
+                    let mut should_break = false;
 
-                // Compute common size and send a combined morsel.
-                let Some(common_size) = self
-                    .input_heads
-                    .iter()
-                    .filter_map(|h| {
-                        if h.is_broadcast == Some(false) {
-                            if let Some(m) = h.morsels.front() {
-                                Some(m.height())
+                    // Compute common size and send a combined morsel.
+                    let Some(common_size) = self
+                        .input_heads
+                        .iter()
+                        .filter_map(|h| {
+                            if h.is_broadcast == Some(false) {
+                                if let Some(m) = h.morsels.front() {
+                                    Some(m.height())
+                                } else {
+                                    should_break |= match self.zip_behavior {
+                                        ZipBehavior::NullExtend => false,
+                                        ZipBehavior::Broadcast | ZipBehavior::Strict => true,
+                                    };
+                                    None
+                                }
                             } else {
-                                should_break |= match self.zip_behavior {
-                                    ZipBehavior::NullExtend => false,
-                                    ZipBehavior::Broadcast | ZipBehavior::Strict => true,
-                                };
                                 None
                             }
-                        } else {
-                            None
-                        }
-                    })
-                    .min()
-                else {
-                    // If all input heads are broadcasts we don't get a common size,
-                    // we handle this below.
-                    break;
-                };
+                        })
+                        .min()
+                    else {
+                        // If all input heads are broadcasts we don't get a common size,
+                        // we handle this below.
+                        break;
+                    };
 
-                if should_break {
-                    break;
-                }
+                    if should_break {
+                        break;
+                    }
 
-                for input_head in &mut self.input_heads {
-                    out.push(input_head.take(common_size).await);
-                }
-                let out_df = concat_df_horizontal(&out, false, true, false)?;
-                out.clear();
+                    for input_head in &mut self.input_heads {
+                        out.push(input_head.take(common_size).await);
+                    }
+                    let out_df = concat_df_horizontal(&out, false, true, false)?;
+                    out.clear();
 
-                let morsel = Morsel::new_unregistered(out_df, self.out_seq, source_token.clone());
-                self.out_seq = self.out_seq.successor();
-                if sender.send(morsel).await.is_err() {
-                    // Our receiver is no longer interested in any data, no
-                    // need store the rest of the incoming stream, can directly
-                    // return.
-                    return Ok(());
-                }
-            }
-
-            // We can't continue because one or more input heads is empty or all
-            // inputs are broadcasts. We must tell everyone to stop, unblock all
-            // pipes by consuming all ConsumeTokens, and then store all data
-            // that was still flowing through the pipelines into input_heads for
-            // the next phase.
-            for input_head in &mut self.input_heads {
-                for morsel in &mut input_head.morsels {
-                    morsel.source_token().stop();
-                    drop(morsel.take_consume_token());
-                }
-            }
-
-            for (recv_idx, opt_recv) in receivers.iter_mut().enumerate() {
-                if let Some(recv) = opt_recv {
-                    while let Some(mut morsel) = recv.recv().await {
-                        morsel.source_token().stop();
-                        drop(morsel.take_consume_token());
-                        self.input_heads[recv_idx]
-                            .add_morsel(morsel, &self.spill_ctx)
-                            .await;
+                    let morsel =
+                        Morsel::new_unregistered(out_df, self.out_seq, source_token.clone());
+                    self.out_seq = self.out_seq.successor();
+                    if sender.send(morsel).await.is_err() {
+                        // Our receiver is no longer interested in any data, no
+                        // need store the rest of the incoming stream, can directly
+                        // return.
+                        return Ok(());
                     }
                 }
-            }
 
-            // If all our input heads are broadcasts we need to send a morsel
-            // once with their output, consuming all broadcast inputs.
-            let all_broadcast = self
-                .input_heads
-                .iter()
-                .all(|h| h.is_broadcast == Some(true));
-            if all_broadcast {
+                // We can't continue because one or more input heads is empty or all
+                // inputs are broadcasts. We must tell everyone to stop, unblock all
+                // pipes by consuming all ConsumeTokens, and then store all data
+                // that was still flowing through the pipelines into input_heads for
+                // the next phase.
                 for input_head in &mut self.input_heads {
-                    out.push(input_head.consume_broadcast().await);
+                    for morsel in &mut input_head.morsels {
+                        morsel.source_token().stop();
+                        drop(morsel.take_consume_token());
+                    }
                 }
-                let out_df = concat_df_horizontal(&out, false, true, false)?;
-                out.clear();
 
-                let morsel = Morsel::new_unregistered(out_df, self.out_seq, source_token.clone());
-                self.out_seq = self.out_seq.successor();
-                let _ = sender.send(morsel).await;
-            }
+                for (recv_idx, opt_recv) in receivers.iter_mut().enumerate() {
+                    if let Some(recv) = opt_recv {
+                        while let Some(mut morsel) = recv.recv().await {
+                            morsel.source_token().stop();
+                            drop(morsel.take_consume_token());
+                            self.input_heads[recv_idx]
+                                .add_morsel(morsel, &self.spill_ctx)
+                                .await;
+                        }
+                    }
+                }
 
-            Ok(())
-        }));
+                // If all our input heads are broadcasts we need to send a morsel
+                // once with their output, consuming all broadcast inputs.
+                let all_broadcast = self
+                    .input_heads
+                    .iter()
+                    .all(|h| h.is_broadcast == Some(true));
+                if all_broadcast {
+                    for input_head in &mut self.input_heads {
+                        out.push(input_head.consume_broadcast().await);
+                    }
+                    let out_df = concat_df_horizontal(&out, false, true, false)?;
+                    out.clear();
+
+                    let morsel =
+                        Morsel::new_unregistered(out_df, self.out_seq, source_token.clone());
+                    self.out_seq = self.out_seq.successor();
+                    let _ = sender.send(morsel).await;
+                }
+
+                Ok(())
+            },
+        ));
     }
 }

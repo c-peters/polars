@@ -110,30 +110,34 @@ impl ComputeNode for RepeatNode {
                 let morsel_count = ideal_morsel_count.next_multiple_of(state.num_pipelines);
                 let morsel_size = repeats_left.div_ceil(morsel_count).max(1);
 
-                join_handles.push(scope.spawn_task(TaskPriority::Low, async move {
-                    let source_token = SourceToken::new();
+                join_handles.push(scope.spawn_task(
+                    TaskPriority::Low,
+                    state.attribution.clone(),
+                    async move {
+                        let source_token = SourceToken::new();
 
-                    let wait_group = WaitGroup::default();
-                    while *repeats_left > 0 && !source_token.stop_requested() {
-                        let height = morsel_size.min(*repeats_left);
-                        let mut morsel = Morsel::new_unregistered(
-                            value.new_from_index(0, height),
-                            *seq,
-                            source_token.clone(),
-                        );
-                        morsel.set_consume_token(wait_group.token());
+                        let wait_group = WaitGroup::default();
+                        while *repeats_left > 0 && !source_token.stop_requested() {
+                            let height = morsel_size.min(*repeats_left);
+                            let mut morsel = Morsel::new_unregistered(
+                                value.new_from_index(0, height),
+                                *seq,
+                                source_token.clone(),
+                            );
+                            morsel.set_consume_token(wait_group.token());
 
-                        *seq = seq.successor();
-                        *repeats_left -= height;
+                            *seq = seq.successor();
+                            *repeats_left -= height;
 
-                        if send.send(morsel).await.is_err() {
-                            break;
+                            if send.send(morsel).await.is_err() {
+                                break;
+                            }
+                            wait_group.wait().await;
                         }
-                        wait_group.wait().await;
-                    }
 
-                    Ok(())
-                }));
+                        Ok(())
+                    },
+                ));
             },
         }
     }

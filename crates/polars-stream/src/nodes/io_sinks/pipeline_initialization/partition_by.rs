@@ -149,7 +149,9 @@ pub fn start_partition_sink_pipeline(
 
     let partitioner_handle = executor::AbortOnDropHandle::new(executor::spawn(
         TaskPriority::High,
+        execution_state.attribution.clone(),
         PartitionerPipeline {
+            attribution: execution_state.attribution.clone(),
             morsel_rx,
             partitioner: Arc::new(partitioner),
             inflight_morsel_semaphore: inflight_morsel_semaphore.clone(),
@@ -164,6 +166,7 @@ pub fn start_partition_sink_pipeline(
     let open_sinks_semaphore = Arc::new(tokio::sync::Semaphore::new(max_open_sinks));
 
     let partition_sink_starter = PartitionSinkStarter {
+        attribution: execution_state.attribution.clone(),
         file_provider,
         writer_starter: Arc::clone(&file_writer_starter),
         sync_on_close,
@@ -172,6 +175,7 @@ pub fn start_partition_sink_pipeline(
     };
 
     let partition_morsel_sender = PartitionMorselSender {
+        attribution: execution_state.attribution.clone(),
         target_sink_morsel_size,
         file_size_limit: file_size_limit.unwrap_or(NonZeroRowCountAndSize::MAX),
         inflight_morsel_semaphore,
@@ -183,7 +187,9 @@ pub fn start_partition_sink_pipeline(
 
     let partition_distributor_handle = executor::AbortOnDropHandle::new(executor::spawn(
         TaskPriority::High,
+        execution_state.attribution.clone(),
         PartitionDistributor {
+            attribution: execution_state.attribution.clone(),
             node_name: node_name.clone(),
             partitioned_dfs_rx,
             partition_morsel_sender,
@@ -198,21 +204,25 @@ pub fn start_partition_sink_pipeline(
         .run(),
     ));
 
-    let handle = executor::AbortOnDropHandle::new(executor::spawn(TaskPriority::Low, async move {
-        partitioner_handle.await;
-        partition_distributor_handle.await?;
+    let handle = executor::AbortOnDropHandle::new(executor::spawn(
+        TaskPriority::Low,
+        execution_state.attribution.clone(),
+        async move {
+            partitioner_handle.await;
+            partition_distributor_handle.await?;
 
-        if let Some(sinked_paths_callback) = sinked_paths_callback {
-            if verbose {
-                eprintln!("{node_name}: Call sinked path info callback");
+            if let Some(sinked_paths_callback) = sinked_paths_callback {
+                if verbose {
+                    eprintln!("{node_name}: Call sinked path info callback");
+                }
+
+                call_sinked_paths_callback(sinked_paths_callback, sinked_path_info_list.unwrap())
+                    .await?;
             }
 
-            call_sinked_paths_callback(sinked_paths_callback, sinked_path_info_list.unwrap())
-                .await?;
-        }
-
-        Ok(())
-    }));
+            Ok(())
+        },
+    ));
 
     Ok(handle)
 }

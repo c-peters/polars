@@ -407,11 +407,13 @@ impl SampleState {
         params.left_is_build = Some(left_is_build);
         let mut sampled_build_morsels = BufferedStream::new(
             "semi-anti-join-left-sample".into(),
+            state.attribution.clone(),
             core::mem::take(&mut self.left),
             MorselSeq::default(),
         );
         let mut sampled_probe_morsels = BufferedStream::new(
             "semi-anti-join-right-sample".into(),
+            state.attribution.clone(),
             core::mem::take(&mut self.right),
             MorselSeq::default(),
         );
@@ -432,12 +434,19 @@ impl SampleState {
             executor::task_scope(|scope| {
                 let mut join_handles = Vec::new();
                 let receivers = sampled_build_morsels
-                    .reinsert(state.num_pipelines, None, scope, &mut join_handles)
+                    .reinsert(
+                        state.num_pipelines,
+                        state.attribution.clone(),
+                        None,
+                        scope,
+                        &mut join_handles,
+                    )
                     .unwrap();
 
                 for (local_builder, recv) in build_state.local_builders.iter_mut().zip(receivers) {
                     join_handles.push(scope.spawn_task(
                         TaskPriority::High,
+                        state.attribution.clone(),
                         BuildState::partition_and_sink(
                             recv,
                             local_builder,
@@ -589,7 +598,12 @@ impl BuildState {
         params.runtime_filters.publish_merged(locals);
     }
 
-    fn finalize(&mut self, params: &SemiAntiJoinParams, grouper: &dyn Grouper) -> ProbeState {
+    fn finalize(
+        &mut self,
+        attribution: polars_async::executor::TaskAttributionHandle,
+        params: &SemiAntiJoinParams,
+        grouper: &dyn Grouper,
+    ) -> ProbeState {
         let left_is_build = params.left_is_build();
 
         // To reduce maximum memory usage we want to drop the original keys
@@ -625,93 +639,99 @@ impl BuildState {
                 let key_drop_q_recv = key_drop_q_recv.clone();
                 let groupers = &groupers;
                 let payloads = &payloads;
-                join_handles.push(s.spawn_task(TaskPriority::High, async move {
-                    // Extract from outer arc and drop outer arc.
-                    let keys_per_local_builder = Arc::unwrap_or_clone(arc_keys_per_local_builder);
+                join_handles.push(s.spawn_task(
+                    TaskPriority::High,
+                    attribution.clone(),
+                    async move {
+                        // Extract from outer arc and drop outer arc.
+                        let keys_per_local_builder =
+                            Arc::unwrap_or_clone(arc_keys_per_local_builder);
 
-                    // Compute cardinality estimate and total amount of
-                    // payload for this partition.
-                    let mut sketch = CardinalitySketch::new();
-                    let mut payload_rows = 0;
-                    for l in local_builders {
-                        sketch.combine(&l.sketch_per_p[p]);
-                        let offsets_len = l.key_idxs_offsets_per_p.len();
-                        payload_rows += l.key_idxs_offsets_per_p[offsets_len - num_partitions + p];
-                    }
-
-                    // Allocate hash table and payload builder.
-                    let mut p_grouper = grouper.new_empty();
-                    p_grouper.reserve(sketch.estimate() * 5 / 4);
-                    let mut p_payload = DataFrameBuilder::new(params.output_schema.clone());
-                    let mut p_group_idxs = Vec::new();
-                    if left_is_build {
-                        p_payload.reserve(payload_rows);
-                        p_group_idxs.reserve(payload_rows);
-                    }
-
-                    // Build.
-                    let mut skip_drop_attempt = false;
-                    for (l, l_keys) in local_builders.iter().zip(keys_per_local_builder) {
-                        // Try to help with dropping the processed keys.
-                        if !skip_drop_attempt {
-                            drop(key_drop_q_recv.try_recv());
+                        // Compute cardinality estimate and total amount of
+                        // payload for this partition.
+                        let mut sketch = CardinalitySketch::new();
+                        let mut payload_rows = 0;
+                        for l in local_builders {
+                            sketch.combine(&l.sketch_per_p[p]);
+                            let offsets_len = l.key_idxs_offsets_per_p.len();
+                            payload_rows +=
+                                l.key_idxs_offsets_per_p[offsets_len - num_partitions + p];
                         }
 
-                        for (i, keys) in l_keys.0.iter().enumerate() {
-                            unsafe {
-                                let p_key_idxs_start =
-                                    l.key_idxs_offsets_per_p[i * num_partitions + p];
-                                let p_key_idxs_stop =
-                                    l.key_idxs_offsets_per_p[(i + 1) * num_partitions + p];
-                                let p_key_idxs =
-                                    &l.key_idxs_values_per_p[p][p_key_idxs_start..p_key_idxs_stop];
-                                if left_is_build {
-                                    p_grouper.insert_keys_subset(
-                                        keys,
-                                        p_key_idxs,
-                                        Some(&mut p_group_idxs),
-                                    );
-                                    let payload = l_keys.1[i].get().await;
-                                    p_payload.gather_extend(
-                                        &payload,
-                                        p_key_idxs,
-                                        ShareStrategy::Never,
-                                    );
-                                } else {
-                                    p_grouper.insert_keys_subset(keys, p_key_idxs, None);
+                        // Allocate hash table and payload builder.
+                        let mut p_grouper = grouper.new_empty();
+                        p_grouper.reserve(sketch.estimate() * 5 / 4);
+                        let mut p_payload = DataFrameBuilder::new(params.output_schema.clone());
+                        let mut p_group_idxs = Vec::new();
+                        if left_is_build {
+                            p_payload.reserve(payload_rows);
+                            p_group_idxs.reserve(payload_rows);
+                        }
+
+                        // Build.
+                        let mut skip_drop_attempt = false;
+                        for (l, l_keys) in local_builders.iter().zip(keys_per_local_builder) {
+                            // Try to help with dropping the processed keys.
+                            if !skip_drop_attempt {
+                                drop(key_drop_q_recv.try_recv());
+                            }
+
+                            for (i, keys) in l_keys.0.iter().enumerate() {
+                                unsafe {
+                                    let p_key_idxs_start =
+                                        l.key_idxs_offsets_per_p[i * num_partitions + p];
+                                    let p_key_idxs_stop =
+                                        l.key_idxs_offsets_per_p[(i + 1) * num_partitions + p];
+                                    let p_key_idxs = &l.key_idxs_values_per_p[p]
+                                        [p_key_idxs_start..p_key_idxs_stop];
+                                    if left_is_build {
+                                        p_grouper.insert_keys_subset(
+                                            keys,
+                                            p_key_idxs,
+                                            Some(&mut p_group_idxs),
+                                        );
+                                        let payload = l_keys.1[i].get().await;
+                                        p_payload.gather_extend(
+                                            &payload,
+                                            p_key_idxs,
+                                            ShareStrategy::Never,
+                                        );
+                                    } else {
+                                        p_grouper.insert_keys_subset(keys, p_key_idxs, None);
+                                    }
                                 }
+                            }
+
+                            if let Some(l) = Arc::into_inner(l_keys) {
+                                // If we're the last thread to process this set of keys we're probably
+                                // falling behind the rest, since the drop can be quite expensive we skip
+                                // a drop attempt hoping someone else will pick up the slack.
+                                drop(key_drop_q_send.try_send(l));
+                                skip_drop_attempt = true;
+                            } else {
+                                skip_drop_attempt = false;
                             }
                         }
 
-                        if let Some(l) = Arc::into_inner(l_keys) {
-                            // If we're the last thread to process this set of keys we're probably
-                            // falling behind the rest, since the drop can be quite expensive we skip
-                            // a drop attempt hoping someone else will pick up the slack.
-                            drop(key_drop_q_send.try_send(l));
-                            skip_drop_attempt = true;
-                        } else {
-                            skip_drop_attempt = false;
+                        // We're done, help others out by doing drops.
+                        drop(key_drop_q_send); // So we don't deadlock trying to receive from ourselves.
+                        while let Ok(l_keys) = key_drop_q_recv.recv().await {
+                            drop(l_keys);
                         }
-                    }
 
-                    // We're done, help others out by doing drops.
-                    drop(key_drop_q_send); // So we don't deadlock trying to receive from ourselves.
-                    while let Ok(l_keys) = key_drop_q_recv.recv().await {
-                        drop(l_keys);
-                    }
-
-                    groupers.try_set(p, p_grouper).ok().unwrap();
-                    payloads
-                        .try_set(
-                            p,
-                            BuildPayload {
-                                rows: p_payload.freeze(),
-                                group_idxs: p_group_idxs,
-                            },
-                        )
-                        .ok()
-                        .unwrap();
-                }));
+                        groupers.try_set(p, p_grouper).ok().unwrap();
+                        payloads
+                            .try_set(
+                                p,
+                                BuildPayload {
+                                    rows: p_payload.freeze(),
+                                    group_idxs: p_group_idxs,
+                                },
+                            )
+                            .ok()
+                            .unwrap();
+                    },
+                ));
             }
 
             // Drop outer arc after spawning each thread so the inner arcs
@@ -891,11 +911,18 @@ impl ProbeState {
         executor::task_scope(|scope| {
             let mut join_handles = Vec::new();
             let receivers = sampled
-                .reinsert(state.num_pipelines, None, scope, &mut join_handles)
+                .reinsert(
+                    state.num_pipelines,
+                    state.attribution.clone(),
+                    None,
+                    scope,
+                    &mut join_handles,
+                )
                 .unwrap();
             for (marks, recv) in self.marks_per_pipeline.iter_mut().zip(receivers) {
                 join_handles.push(scope.spawn_task(
                     TaskPriority::High,
+                    state.attribution.clone(),
                     ProbeState::partition_and_mark(
                         recv,
                         &self.grouper_per_partition,
@@ -1017,6 +1044,7 @@ impl ComputeNode for SemiAntiJoinNode {
         send: &mut [PortState],
         state: &StreamingExecutionState,
     ) -> PolarsResult<()> {
+        self.spill_ctx.set_attribution(state.attribution.clone());
         assert!(recv.len() == 2 && send.len() == 1);
 
         // If the output doesn't want any more data, transition to being done.
@@ -1051,7 +1079,11 @@ impl ComputeNode for SemiAntiJoinNode {
                 if self.params.empty_build_gives_empty_output() && build_state.is_empty() {
                     self.state = SemiAntiJoinState::Done;
                 } else {
-                    let mut probe_state = build_state.finalize(&self.params, &*self.grouper);
+                    let mut probe_state = build_state.finalize(
+                        state.attribution.clone(),
+                        &self.params,
+                        &*self.grouper,
+                    );
                     if self.params.left_is_build() {
                         probe_state.mark_sampled(&self.params, state)?;
                     }
@@ -1191,6 +1223,7 @@ impl ComputeNode for SemiAntiJoinNode {
                 if let Some(left_recv) = recv_ports[0].take() {
                     join_handles.push(scope.spawn_task(
                         TaskPriority::High,
+                        state.attribution.clone(),
                         sample_sink(
                             left_recv.serial(),
                             &mut sample_state.left,
@@ -1204,6 +1237,7 @@ impl ComputeNode for SemiAntiJoinNode {
                 if let Some(right_recv) = recv_ports[1].take() {
                     join_handles.push(scope.spawn_task(
                         TaskPriority::High,
+                        state.attribution.clone(),
                         sample_sink(
                             right_recv.serial(),
                             &mut sample_state.right,
@@ -1224,6 +1258,7 @@ impl ComputeNode for SemiAntiJoinNode {
                 for (local_builder, recv) in build_state.local_builders.iter_mut().zip(receivers) {
                     join_handles.push(scope.spawn_task(
                         TaskPriority::High,
+                        state.attribution.clone(),
                         BuildState::partition_and_sink(
                             recv,
                             local_builder,
@@ -1241,6 +1276,7 @@ impl ComputeNode for SemiAntiJoinNode {
                     .sampled_probe_morsels
                     .reinsert(
                         state.num_pipelines,
+                        state.attribution.clone(),
                         recv_ports[probe_idx].take(),
                         scope,
                         join_handles,
@@ -1253,6 +1289,7 @@ impl ComputeNode for SemiAntiJoinNode {
                     for (marks, recv) in probe_state.marks_per_pipeline.iter_mut().zip(receivers) {
                         join_handles.push(scope.spawn_task(
                             TaskPriority::High,
+                            state.attribution.clone(),
                             ProbeState::partition_and_mark(
                                 recv,
                                 &probe_state.grouper_per_partition,
@@ -1268,6 +1305,7 @@ impl ComputeNode for SemiAntiJoinNode {
                     for (recv, send) in receivers.into_iter().zip(senders) {
                         join_handles.push(scope.spawn_task(
                             TaskPriority::High,
+                            state.attribution.clone(),
                             ProbeState::partition_and_probe(
                                 recv,
                                 send,
@@ -1286,6 +1324,7 @@ impl ComputeNode for SemiAntiJoinNode {
                 let send = send_ports[0].take().unwrap().serial();
                 join_handles.push(scope.spawn_task(
                     TaskPriority::Low,
+                    state.attribution.clone(),
                     emit_state.emit(send, state.num_pipelines),
                 ));
             },

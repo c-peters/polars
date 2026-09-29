@@ -20,6 +20,7 @@ use crate::nodes::io_sources::multi_scan::reader_interface::output::FileReaderOu
 ///
 /// Used for negative slicing in NDJSON, where the morsels of the file are sent from back to front.
 pub struct MorselStreamReverser {
+    pub attribution: polars_async::executor::TaskAttributionHandle,
     pub morsel_receiver: Linearizer<Priority<Reverse<MorselSeq>, DataFrame>>,
     /// We have parallel output as we spawn tasks to perform slicing and adding row_index in
     /// parallel.
@@ -33,6 +34,7 @@ pub struct MorselStreamReverser {
 impl MorselStreamReverser {
     pub async fn run(self) -> PolarsResult<()> {
         let MorselStreamReverser {
+            attribution,
             mut morsel_receiver,
             morsel_senders,
             offset_len_rtl,
@@ -175,49 +177,56 @@ impl MorselStreamReverser {
                 let chunk_idx_arc = chunk_idx_arc.clone();
                 let combined_df = combined_df.clone();
                 let row_index = row_index.clone();
-                AbortOnDropHandle::new(executor::spawn(TaskPriority::Low, async move {
-                    loop {
-                        let chunk_idx =
-                            chunk_idx_arc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                AbortOnDropHandle::new(executor::spawn(
+                    TaskPriority::Low,
+                    attribution.clone(),
+                    async move {
+                        loop {
+                            let chunk_idx =
+                                chunk_idx_arc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                        if chunk_idx >= n_chunks {
-                            break;
-                        }
+                            if chunk_idx >= n_chunks {
+                                break;
+                            }
 
-                        let row_offset = chunk_idx.saturating_mul(chunk_size);
-                        let mut df = combined_df.slice(row_offset.try_into().unwrap(), chunk_size);
+                            let row_offset = chunk_idx.saturating_mul(chunk_size);
+                            let mut df =
+                                combined_df.slice(row_offset.try_into().unwrap(), chunk_size);
 
-                        assert!(df.height() > 0); // If we did our calculations properly
+                            assert!(df.height() > 0); // If we did our calculations properly
 
-                        if let Some(row_index) = row_index.clone() {
-                            let offset = row_index.offset.saturating_add(
-                                IdxSize::try_from(row_offset).unwrap_or(IdxSize::MAX),
+                            if let Some(row_index) = row_index.clone() {
+                                let offset = row_index.offset.saturating_add(
+                                    IdxSize::try_from(row_offset).unwrap_or(IdxSize::MAX),
+                                );
+
+                                if offset.checked_add(df.height() as IdxSize).is_none() {
+                                    polars_bail!(
+                                        ComputeError:
+                                        "row_index with offset {} overflows at {} rows",
+                                        row_index.offset, row_offset.saturating_add(df.height())
+                                    )
+                                };
+
+                                unsafe {
+                                    df.with_row_index_mut(row_index.name.clone(), Some(offset))
+                                };
+                            }
+
+                            let morsel = Morsel::new_unregistered(
+                                df,
+                                MorselSeq::new(chunk_idx as u64),
+                                SourceToken::new(),
                             );
 
-                            if offset.checked_add(df.height() as IdxSize).is_none() {
-                                polars_bail!(
-                                    ComputeError:
-                                    "row_index with offset {} overflows at {} rows",
-                                    row_index.offset, row_offset.saturating_add(df.height())
-                                )
-                            };
-
-                            unsafe { df.with_row_index_mut(row_index.name.clone(), Some(offset)) };
+                            if morsel_tx.send_morsel(morsel).await.is_err() {
+                                break;
+                            }
                         }
 
-                        let morsel = Morsel::new_unregistered(
-                            df,
-                            MorselSeq::new(chunk_idx as u64),
-                            SourceToken::new(),
-                        );
-
-                        if morsel_tx.send_morsel(morsel).await.is_err() {
-                            break;
-                        }
-                    }
-
-                    Ok(())
-                }))
+                        Ok(())
+                    },
+                ))
             })
             .collect::<Vec<_>>();
 

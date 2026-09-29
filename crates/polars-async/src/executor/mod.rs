@@ -39,9 +39,6 @@ thread_local! {
     pub static ALLOW_RAYON_THREADS: Cell<bool> = const { Cell::new(true) };
     pub static THREAD_SPAWNED_BY_POLARS_EXECUTOR: Cell<bool> = const { Cell::new(false) };
 
-    /// Attribution inherited by tasks spawned during the current poll.
-    static TLS_ATTRIBUTION: Cell<Option<Arc<dyn TaskAttribution>>> = const { Cell::new(None) };
-
     /// Used to store which executor thread this is.
     static TLS_THREAD_ID: Cell<usize> = const { Cell::new(usize::MAX) };
     /// In which NUMA region is this executor thread supposed to run.
@@ -170,30 +167,21 @@ pub fn worker_state_times() -> WorkerStateTimes {
     total
 }
 
-/// Captures the current attribution and restores it on each poll, including
-/// when the future runs on another runtime.
-pub fn with_current_attribution<F: Future>(fut: F) -> AttributedFuture<F> {
-    AttributedFuture {
-        attribution: current_task_attribution(),
-        fut,
+/// Explicit query/node ownership of a computational task. An empty handle is ownerless.
+#[derive(Clone, Default)]
+pub struct TaskAttributionHandle(Option<Arc<dyn TaskAttribution>>);
+
+impl TaskAttributionHandle {
+    pub fn new(attribution: Arc<dyn TaskAttribution>) -> Self {
+        Self(Some(attribution))
     }
 }
 
-pin_project_lite::pin_project! {
-    pub struct AttributedFuture<F> {
-        attribution: Option<Arc<dyn TaskAttribution>>,
-        #[pin]
-        fut: F,
-    }
-}
-
-impl<F: Future> Future for AttributedFuture<F> {
-    type Output = F::Output;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let _guard = scoped_task_attribution(this.attribution.clone());
-        this.fut.poll(cx)
+impl std::fmt::Debug for TaskAttributionHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TaskAttributionHandle")
+            .field(&self.0.is_some())
+            .finish()
     }
 }
 
@@ -203,31 +191,6 @@ fn new_task_metrics(attribution: Option<&Arc<dyn TaskAttribution>>) -> Option<Ar
         attribution.task_spawned(metrics);
     }
     metrics
-}
-
-/// Restores the previous attribution when dropped.
-#[must_use = "dropping the guard immediately restores the previous attribution"]
-pub struct AttributionGuard(Option<Arc<dyn TaskAttribution>>);
-
-impl Drop for AttributionGuard {
-    fn drop(&mut self) {
-        let previous = self.0.take();
-        TLS_ATTRIBUTION.with(|slot| slot.set(previous));
-    }
-}
-
-/// Credits tasks spawned from this thread to `attribution` until the guard drops.
-pub fn scoped_task_attribution(attribution: Option<Arc<dyn TaskAttribution>>) -> AttributionGuard {
-    AttributionGuard(TLS_ATTRIBUTION.with(|slot| slot.replace(attribution)))
-}
-
-fn current_task_attribution() -> Option<Arc<dyn TaskAttribution>> {
-    // `Cell` cannot lend a reference, so take and put back.
-    TLS_ATTRIBUTION.with(|slot| {
-        let current = slot.take();
-        slot.set(current.clone());
-        current
-    })
 }
 
 static GLOBAL_SCHEDULER: OnceLock<Executor> = OnceLock::new();
@@ -267,8 +230,8 @@ struct TaskMetadata {
     freshly_spawned: AtomicBool,
     scoped: Option<ScopedTaskMetadata>,
     metrics: Option<Arc<TaskMetrics>>,
-    /// Inherited at spawn and restored during each poll.
-    attribution: Option<Arc<dyn TaskAttribution>>,
+    /// Retained across polls and worker migration.
+    attribution: TaskAttributionHandle,
 }
 
 impl Drop for TaskMetadata {
@@ -589,11 +552,10 @@ impl Executor {
                     // Read before running: `run` consumes the task.
                     let metrics = task.metadata().metrics.clone();
                     let attribution = task.metadata().attribution.clone();
-                    let had_attribution = attribution.is_some();
+                    let had_attribution = attribution.0.is_some();
 
                     // Count overlapping polls once toward node occupancy.
-                    let _occupancy = attribution.as_ref().and_then(|a| a.poll_session());
-                    let _attribution = scoped_task_attribution(attribution);
+                    let _occupancy = attribution.0.as_ref().and_then(|a| a.poll_session());
 
                     let cpu_start = TRACK_POLL_CPU.load().then(thread_cpu_ns).flatten();
                     let start = Instant::now();
@@ -748,6 +710,7 @@ impl<'scope> TaskScope<'scope, '_> {
     pub fn spawn_task<F: Future + Send + 'scope>(
         &self,
         priority: TaskPriority,
+        attribution: TaskAttributionHandle,
         fut: F,
     ) -> JoinHandle<F::Output>
     where
@@ -760,8 +723,7 @@ impl<'scope> TaskScope<'scope, '_> {
         let mut join_handle = None;
         // `task_spawned` takes the graph metrics lock; call it before locking
         // `cancel_handles` to avoid lock inversion.
-        let attribution = current_task_attribution();
-        let metrics = new_task_metrics(attribution.as_ref());
+        let metrics = new_task_metrics(attribution.0.as_ref());
 
         self.cancel_handles.lock().insert_with_key(|task_key| {
             let dyn_task = unsafe {
@@ -821,15 +783,18 @@ where
 }
 
 #[track_caller]
-pub fn spawn<F: Future + Send + 'static>(priority: TaskPriority, fut: F) -> JoinHandle<F::Output>
+pub fn spawn<F: Future + Send + 'static>(
+    priority: TaskPriority,
+    attribution: TaskAttributionHandle,
+    fut: F,
+) -> JoinHandle<F::Output>
 where
     <F as Future>::Output: Send + 'static,
 {
     let spawn_location = Location::caller();
     let executor = Executor::global();
     let on_wake = move |task| executor.schedule_task(task);
-    let attribution = current_task_attribution();
-    let metrics = new_task_metrics(attribution.as_ref());
+    let metrics = new_task_metrics(attribution.0.as_ref());
     let dyn_task = task::spawn(
         fut,
         on_wake,
@@ -906,3 +871,6 @@ fn random_permutation<R: Rng>(len: u32, rng: &mut R) -> impl Iterator<Item = u32
             i
         })
 }
+
+#[cfg(test)]
+mod attribution_tests;

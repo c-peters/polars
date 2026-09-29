@@ -91,6 +91,7 @@ impl FileWriterStarter for NDJsonWriterStarter {
 
     fn start_file_writer(
         &self,
+        attribution: polars_async::executor::TaskAttributionHandle,
         morsel_rx: connector::Receiver<SinkMorsel>,
         file: FileOpenTaskHandle,
         num_pipelines: std::num::NonZeroUsize,
@@ -120,7 +121,9 @@ impl FileWriterStarter for NDJsonWriterStarter {
 
         let serializer_handle = executor::spawn(
             TaskPriority::High,
+            attribution.clone(),
             morsel_serializer::MorselSerializerPipeline {
+                attribution: attribution.clone(),
                 morsel_rx,
                 filled_serializer_tx,
                 reuse_serializer_rx,
@@ -130,10 +133,14 @@ impl FileWriterStarter for NDJsonWriterStarter {
             .run(),
         );
 
-        Ok(executor::spawn(TaskPriority::Low, async move {
-            io_handle.await.unwrap()?;
-            serializer_handle.await;
-            Ok(())
-        }))
+        Ok(executor::spawn(
+            TaskPriority::Low,
+            attribution.clone(),
+            async move {
+                io_handle.await.unwrap()?;
+                serializer_handle.await;
+                Ok(())
+            },
+        ))
     }
 }

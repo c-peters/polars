@@ -23,6 +23,13 @@ pub(super) struct SpillFrameSearchBuffer {
 }
 
 impl SpillFrameSearchBuffer {
+    pub(super) fn set_attribution(
+        &self,
+        attribution: polars_async::executor::TaskAttributionHandle,
+    ) {
+        self.spill_ctx.set_attribution(attribution);
+    }
+
     pub(super) fn empty_with_schema(schema: SchemaRef, spill_ctx: RandomSpillContext) -> Self {
         SpillFrameSearchBuffer {
             schema,

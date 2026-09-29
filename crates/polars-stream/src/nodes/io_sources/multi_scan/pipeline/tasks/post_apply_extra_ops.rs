@@ -12,6 +12,7 @@ use crate::nodes::io_sources::multi_scan::components::apply_extra_ops::ApplyExtr
 use crate::nodes::io_sources::multi_scan::reader_interface::output::FileReaderOutputRecv;
 
 pub struct PostApplyExtraOps {
+    pub attribution: polars_async::executor::TaskAttributionHandle,
     pub reader_output_port: FileReaderOutputRecv,
     pub ops_applier: Arc<ApplyExtraOps>,
     /// We have this because initialization of `ops_applier` causes `reader_output_port` to have the
@@ -25,6 +26,7 @@ pub struct PostApplyExtraOps {
 impl PostApplyExtraOps {
     pub fn run(self) -> (MorselLinearizer, AbortOnDropHandle<PolarsResult<()>>) {
         let PostApplyExtraOps {
+            attribution,
             mut reader_output_port,
             ops_applier,
             first_morsel,
@@ -44,7 +46,7 @@ impl PostApplyExtraOps {
         // Distributor
         {
             let ops_applier = ops_applier.clone();
-            executor::spawn(TaskPriority::Low, async move {
+            executor::spawn(TaskPriority::Low, attribution.clone(), async move {
                 // Position tracking
                 let mut row_counter: RowCounter = first_morsel_position;
 
@@ -126,39 +128,47 @@ impl PostApplyExtraOps {
                 let rows_before = rows_before.clone();
                 let rows_after = rows_after.clone();
 
-                AbortOnDropHandle::new(executor::spawn(TaskPriority::Low, async move {
-                    while let Ok((mut morsel, row_offset)) = morsel_rx.recv().await {
-                        rows_before.fetch_add(morsel.height() as u64);
-                        let mut df = morsel.df_mut().await;
-                        ops_applier.apply_to_df(&mut df, row_offset)?;
-                        drop(df);
-                        rows_after.fetch_add(morsel.height() as u64);
-                        if morsel_tx.insert(morsel).await.is_err() {
-                            break;
+                AbortOnDropHandle::new(executor::spawn(
+                    TaskPriority::Low,
+                    attribution.clone(),
+                    async move {
+                        while let Ok((mut morsel, row_offset)) = morsel_rx.recv().await {
+                            rows_before.fetch_add(morsel.height() as u64);
+                            let mut df = morsel.df_mut().await;
+                            ops_applier.apply_to_df(&mut df, row_offset)?;
+                            drop(df);
+                            rows_after.fetch_add(morsel.height() as u64);
+                            if morsel_tx.insert(morsel).await.is_err() {
+                                break;
+                            }
                         }
-                    }
 
-                    PolarsResult::Ok(())
-                }))
+                        PolarsResult::Ok(())
+                    },
+                ))
             })
             .collect::<Vec<_>>();
 
-        let handle = AbortOnDropHandle::new(executor::spawn(TaskPriority::Low, async move {
-            for handle in worker_handles {
-                handle.await?;
-            }
+        let handle = AbortOnDropHandle::new(executor::spawn(
+            TaskPriority::Low,
+            attribution.clone(),
+            async move {
+                for handle in worker_handles {
+                    handle.await?;
+                }
 
-            //@TODO: known issue: we never get here when the returned df is empty
-            if verbose {
-                eprintln!(
-                    "[PostApplyExtraOps]: rows_before: {}, rows_after: {}",
-                    rows_before.load(),
-                    rows_after.load(),
-                );
-            }
+                //@TODO: known issue: we never get here when the returned df is empty
+                if verbose {
+                    eprintln!(
+                        "[PostApplyExtraOps]: rows_before: {}, rows_after: {}",
+                        rows_before.load(),
+                        rows_after.load(),
+                    );
+                }
 
-            Ok(())
-        }));
+                Ok(())
+            },
+        ));
 
         (rx, handle)
     }

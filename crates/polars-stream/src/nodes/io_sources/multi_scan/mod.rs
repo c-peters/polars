@@ -58,7 +58,7 @@ impl ComputeNode for MultiScan {
         &mut self,
         recv: &mut [crate::graph::PortState],
         send: &mut [crate::graph::PortState],
-        _state: &StreamingExecutionState,
+        state: &StreamingExecutionState,
     ) -> polars_error::PolarsResult<()> {
         use MultiScanState::*;
         assert!(recv.is_empty());
@@ -72,9 +72,11 @@ impl ComputeNode for MultiScan {
             // Refresh first - in case there is an error we end here instead of ending when we go
             // into spawn.
             executor::task_scope(|s| {
-                ASYNC.block_in_place_on(
-                    s.spawn_task(TaskPriority::High, self.state.refresh(self.verbose)),
-                )
+                ASYNC.block_in_place_on(s.spawn_task(
+                    TaskPriority::High,
+                    state.attribution.clone(),
+                    self.state.refresh(self.verbose),
+                ))
             })?;
 
             match self.state {
@@ -99,62 +101,66 @@ impl ComputeNode for MultiScan {
         let phase_morsel_tx = send_ports[0].take().unwrap().serial();
         let verbose = self.verbose;
 
-        join_handles.push(scope.spawn_task(TaskPriority::Low, async move {
-            use MultiScanState::*;
+        join_handles.push(scope.spawn_task(
+            TaskPriority::Low,
+            state.attribution.clone(),
+            async move {
+                use MultiScanState::*;
 
-            self.state
-                .initialize(state.clone(), self.metrics_registry.is_some());
+                self.state
+                    .initialize(state.clone(), self.metrics_registry.is_some());
 
-            if let Initialized { io_metrics, .. } = &self.state {
-                if let Some(io_metrics) = io_metrics.as_ref() {
-                    self.metrics_registry
-                        .register_io_metrics(io_metrics.clone())
-                }
-            }
-
-            self.state.refresh(verbose).await?;
-
-            match &mut self.state {
-                Uninitialized { .. } => unreachable!(),
-
-                Finished => return Ok(()),
-
-                Initialized {
-                    phase_channel_tx,
-                    wait_group,
-                    ..
-                } => {
-                    use polars_async::primitives::connector::SendError;
-
-                    match phase_channel_tx.try_send((phase_morsel_tx, wait_group.token())) {
-                        Ok(_) => wait_group.wait().await,
-
-                        // Should never: We only send the next value once the wait token is dropped.
-                        Err(SendError::Full(_)) => unreachable!(),
-
-                        // Bridge has disconnected from the reader side. We know this because
-                        // we are still holding `phase_channel_tx`.
-                        Err(SendError::Closed(_)) => {
-                            if verbose {
-                                eprintln!("[MultiScan]: Bridge disconnected")
-                            }
-
-                            let Initialized { task_handle, .. } =
-                                std::mem::replace(&mut self.state, Finished)
-                            else {
-                                unreachable!()
-                            };
-
-                            task_handle.await?;
-
-                            return Ok(());
-                        },
+                if let Initialized { io_metrics, .. } = &self.state {
+                    if let Some(io_metrics) = io_metrics.as_ref() {
+                        self.metrics_registry
+                            .register_io_metrics(io_metrics.clone())
                     }
-                },
-            }
+                }
 
-            self.state.refresh(verbose).await
-        }));
+                self.state.refresh(verbose).await?;
+
+                match &mut self.state {
+                    Uninitialized { .. } => unreachable!(),
+
+                    Finished => return Ok(()),
+
+                    Initialized {
+                        phase_channel_tx,
+                        wait_group,
+                        ..
+                    } => {
+                        use polars_async::primitives::connector::SendError;
+
+                        match phase_channel_tx.try_send((phase_morsel_tx, wait_group.token())) {
+                            Ok(_) => wait_group.wait().await,
+
+                            // Should never: We only send the next value once the wait token is dropped.
+                            Err(SendError::Full(_)) => unreachable!(),
+
+                            // Bridge has disconnected from the reader side. We know this because
+                            // we are still holding `phase_channel_tx`.
+                            Err(SendError::Closed(_)) => {
+                                if verbose {
+                                    eprintln!("[MultiScan]: Bridge disconnected")
+                                }
+
+                                let Initialized { task_handle, .. } =
+                                    std::mem::replace(&mut self.state, Finished)
+                                else {
+                                    unreachable!()
+                                };
+
+                                task_handle.await?;
+
+                                return Ok(());
+                            },
+                        }
+                    },
+                }
+
+                self.state.refresh(verbose).await
+            },
+        ));
     }
 }
 

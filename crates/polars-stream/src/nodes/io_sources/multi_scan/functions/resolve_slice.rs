@@ -97,6 +97,7 @@ async fn resolve_negative_slice(
 
     let mut readers_init_iter = futures::stream::iter((0..config.sources.len()).rev())
         .map(|scan_source_idx| {
+            let attribution = execution_state.attribution.clone();
             let sources = config.sources.clone();
             let cloud_options = config.cloud_options.clone();
             let file_reader_builder = config.file_reader_builder.clone();
@@ -118,23 +119,28 @@ async fn resolve_negative_slice(
                     Ok(reader)
                 });
 
-            AbortOnDropHandle::new(executor::spawn(TaskPriority::Low, async move {
-                let mut reader = reader?;
+            AbortOnDropHandle::new(executor::spawn(
+                TaskPriority::Low,
+                attribution.clone(),
+                async move {
+                    let mut reader = reader?;
 
-                if verbose {
-                    eprintln!("resolve_negative_slice(): init scan source {scan_source_idx}");
-                }
+                    if verbose {
+                        eprintln!("resolve_negative_slice(): init scan source {scan_source_idx}");
+                    }
 
-                let row_deletions = deletion_files_provider.spawn_row_deletions_init(
-                    scan_source_idx,
-                    cloud_options,
-                    num_pipelines,
-                    verbose,
-                );
+                    let row_deletions = deletion_files_provider.spawn_row_deletions_init(
+                        attribution.clone(),
+                        scan_source_idx,
+                        cloud_options,
+                        num_pipelines,
+                        verbose,
+                    );
 
-                reader.initialize().await?;
-                PolarsResult::Ok((scan_source_idx, reader, row_deletions))
-            }))
+                    reader.initialize().await?;
+                    PolarsResult::Ok((scan_source_idx, reader, row_deletions))
+                },
+            ))
         })
         .buffered(config.n_readers_pre_init().max(1));
 
@@ -147,7 +153,9 @@ async fn resolve_negative_slice(
     while let Some((scan_source_idx, mut file_reader, row_deletions)) =
         readers_init_iter.next().await.transpose()?
     {
-        let n_rows = file_reader.n_rows_in_file().await?;
+        let n_rows = file_reader
+            .n_rows_in_file(execution_state.attribution.clone())
+            .await?;
 
         let n_rows_deleted = if let Some(row_deletions) = row_deletions {
             let mask = row_deletions.into_external_filter_mask().await?;
@@ -225,7 +233,9 @@ async fn resolve_negative_slice(
         while let Some((_scan_source_idx, mut reader, row_deletions)) =
             readers_init_iter.next().await.transpose()?
         {
-            let n_rows = reader.n_rows_in_file().await?;
+            let n_rows = reader
+                .n_rows_in_file(execution_state.attribution.clone())
+                .await?;
 
             let row_deletions = if let Some(row_deletions) = row_deletions {
                 Some(row_deletions.into_external_filter_mask().await?)

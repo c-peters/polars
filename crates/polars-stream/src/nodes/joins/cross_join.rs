@@ -169,8 +169,10 @@ impl ComputeNode for CrossJoinNode {
                     let right_input_schema = self.right_input_schema.clone();
                     let right_rename = &self.right_rename;
                     let build_df = &*build_df;
-                    join_handles.push(
-                        scope.spawn_task(TaskPriority::High, async move {
+                    join_handles.push(scope.spawn_task(
+                        TaskPriority::High,
+                        state.attribution.clone(),
+                        async move {
                             let mut build_repeater = DataFrameBuilder::new(left_input_schema);
                             let mut probe_repeater = DataFrameBuilder::new(right_input_schema);
                             if !left_is_build {
@@ -262,8 +264,8 @@ impl ComputeNode for CrossJoinNode {
                                 }
                             }
                             Ok(())
-                        }),
-                    );
+                        },
+                    ));
                 }
             },
             CrossJoinState::Done => unreachable!(),

@@ -258,7 +258,7 @@ impl ComputeNode for RangeJoinNode {
                 let recv = recv_ports[interval_idx].take().unwrap().parallel();
                 let send = send_ports[0].take().unwrap().parallel();
                 join_handles.extend(Iterator::zip(recv.into_iter(), send).map(|(recv, send)| {
-                    scope.spawn_task(TaskPriority::High, async move {
+                    scope.spawn_task(TaskPriority::High, state.attribution.clone(), async move {
                         compute_and_emit_task(recv, send, probe_state, params).await
                     })
                 }));

@@ -3,9 +3,13 @@ use polars_async::primitives::opt_spawned_future::parallelize_first_to_local;
 use polars_core::prelude::Column;
 
 /// Parallel rechunk of each column over the computational async executor.
-pub async fn rechunk_par(columns: &mut [Column]) {
+pub async fn rechunk_par(
+    columns: &mut [Column],
+    attribution: polars_async::executor::TaskAttributionHandle,
+) {
     for fut in parallelize_first_to_local(
         TaskPriority::Low,
+        attribution.clone(),
         columns.iter_mut().enumerate().filter_map(|(i, c)| {
             (c.n_chunks() > 1).then(|| {
                 let c = std::mem::take(c);

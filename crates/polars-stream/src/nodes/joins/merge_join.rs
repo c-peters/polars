@@ -189,6 +189,10 @@ impl ComputeNode for MergeJoinNode {
         send: &mut [PortState],
         state: &StreamingExecutionState,
     ) -> PolarsResult<()> {
+        self.build_unmerged
+            .set_attribution(state.attribution.clone());
+        self.probe_unmerged
+            .set_attribution(state.attribution.clone());
         use MergeJoinState::*;
 
         assert!(recv.len() == 2 && send.len() == 1);
@@ -295,21 +299,25 @@ impl ComputeNode for MergeJoinNode {
                 let (mut distributor, dist_recv) =
                     distributor_channel(send.len(), *DEFAULT_DISTRIBUTOR_BUFFER_SIZE);
                 let (unmatched_send, mut unmatched_recv) = tokio::sync::mpsc::channel(send.len());
-                join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                    find_mergeable_task(
-                        recv_build,
-                        recv_probe,
-                        build_unmerged,
-                        probe_unmerged,
-                        &mut distributor,
-                        params,
-                        mergeable_seq,
-                    )
-                    .await
-                }));
+                join_handles.push(scope.spawn_task(
+                    TaskPriority::High,
+                    state.attribution.clone(),
+                    async move {
+                        find_mergeable_task(
+                            recv_build,
+                            recv_probe,
+                            build_unmerged,
+                            probe_unmerged,
+                            &mut distributor,
+                            params,
+                            mergeable_seq,
+                        )
+                        .await
+                    },
+                ));
                 join_handles.extend(dist_recv.into_iter().zip(send).map(|(mut recv, mut send)| {
                     let unmatched_send = unmatched_send.clone();
-                    scope.spawn_task(TaskPriority::High, async move {
+                    scope.spawn_task(TaskPriority::High, state.attribution.clone(), async move {
                         let mut arenas = ComputeJoinArenas::default();
                         while let Ok((build, probe, seq, source_token)) = recv.recv().await {
                             compute_join_and_send(
@@ -327,12 +335,16 @@ impl ComputeNode for MergeJoinNode {
                         Ok(())
                     })
                 }));
-                join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                    while let Some((seq, df)) = unmatched_recv.recv().await {
-                        unmatched.push((seq, df));
-                    }
-                    Ok(())
-                }));
+                join_handles.push(scope.spawn_task(
+                    TaskPriority::High,
+                    state.attribution.clone(),
+                    async move {
+                        while let Some((seq, df)) = unmatched_recv.recv().await {
+                            unmatched.push((seq, df));
+                        }
+                        Ok(())
+                    },
+                ));
             },
             EmitUnmatched(src_node) => {
                 assert!(recv_ports[0].is_none());

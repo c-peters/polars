@@ -26,6 +26,8 @@ struct Snapshot {
     total_rows_sent: u64,
     any_done: bool,
     custom: Vec<(String, Option<i64>)>,
+    // Per-node polls and row flow make missing compute ownership observable.
+    node_polls: Vec<(u64, u64, u64)>,
 }
 
 impl Snapshot {
@@ -104,6 +106,16 @@ impl Drop for CloseGuard {
             let snap = metrics.snapshot();
             self.log.lock().unwrap().push(Event::Snapshot(Snapshot {
                 rows: snap.len(),
+                node_polls: snap
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.phys_node_key,
+                            r.total_polls,
+                            r.rows_sent + r.rows_received,
+                        )
+                    })
+                    .collect(),
                 total_rows_sent: snap.iter().map(|r| r.rows_sent).sum(),
                 any_done: snap.iter().any(|r| r.done),
                 custom: snap
@@ -144,6 +156,37 @@ fn run_observed_on(
 
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "parquet")]
+    fn scan_and_processing_tasks_keep_node_ownership() {
+        // Real Parquet work crosses Tokio before spawning decoding tasks; group-by
+        // also spawns tasks during update_state after the input phase completes.
+        let lf = scan_foods_parquet(true)
+            .group_by([col("category")])
+            .agg([col("calories").sum()]);
+        let (result, events) = run_observed_on(lf, true, Engine::Streaming);
+        assert!(result.is_ok(), "{result:?}");
+        let snapshot = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Snapshot(snapshot) => Some(snapshot),
+                _ => None,
+            })
+            .unwrap();
+        let active_nodes: Vec<_> = snapshot
+            .node_polls
+            .iter()
+            .filter(|(_, _, rows)| *rows > 0)
+            .collect();
+        assert!(
+            active_nodes.len() >= 3,
+            "expected scan, aggregation and sink: {active_nodes:?}"
+        );
+        for (key, polls, _) in active_nodes {
+            assert!(*polls > 0, "node {key} moved rows without attributed tasks");
+        }
+    }
 
     #[test]
     fn observer_called_on_successful_query() {

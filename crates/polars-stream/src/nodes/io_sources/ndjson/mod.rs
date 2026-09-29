@@ -163,6 +163,7 @@ impl FileReader for NDJsonFileReader {
         } = self.init_data.clone().unwrap();
 
         let BeginReadArgs {
+            attribution,
             projection: Projection::Plain(projected_schema),
             mut row_index,
             pre_slice,
@@ -290,7 +291,9 @@ impl FileReader for NDJsonFileReader {
 
             Some(AbortOnDropHandle::new(spawn(
                 TaskPriority::High,
+                attribution.clone(),
                 MorselStreamReverser {
+                    attribution: attribution.clone(),
                     morsel_receiver: opt_linearizer.unwrap(),
                     morsel_senders,
                     offset_len_rtl: (
@@ -345,6 +348,7 @@ impl FileReader for NDJsonFileReader {
             } else {
                 Some(AbortOnDropHandle::new(spawn(
                     TaskPriority::High,
+                    attribution.clone(),
                     task.run(),
                 )))
             }
@@ -380,6 +384,7 @@ impl FileReader for NDJsonFileReader {
 
                 AbortOnDropHandle::new(spawn(
                     TaskPriority::Low,
+                    attribution.clone(),
                     LineBatchProcessor {
                         worker_idx,
 
@@ -491,6 +496,7 @@ impl FileReader for NDJsonFileReader {
 
         let line_batch_distributor_task_handle = AbortOnDropHandle::new(spawn(
             TaskPriority::Low,
+            attribution.clone(),
             line_batch_distributor::LineBatchDistributor {
                 reader: reader_source,
                 reverse: is_negative_slice,
@@ -505,7 +511,7 @@ impl FileReader for NDJsonFileReader {
         ));
 
         // Task. Finishing handle.
-        let finishing_handle = spawn(TaskPriority::Low, async move {
+        let finishing_handle = spawn(TaskPriority::Low, attribution.clone(), async move {
             // Number of rows skipped by the line batch distributor.
             let n_rows_skipped: usize = line_batch_distributor_task_handle.await?;
 

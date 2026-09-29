@@ -126,48 +126,55 @@ impl ComputeNode for IOSinkNode {
 
         let phase_morsel_rx = recv_ports[0].take().unwrap().serial();
 
-        join_handles.push(scope.spawn_task(TaskPriority::Low, async move {
-            self.state
-                .initialize(&self.name, execution_state, self.metrics_registry.is_some())?;
+        join_handles.push(scope.spawn_task(
+            TaskPriority::Low,
+            execution_state.attribution.clone(),
+            async move {
+                self.state.initialize(
+                    &self.name,
+                    execution_state,
+                    self.metrics_registry.is_some(),
+                )?;
 
-            let IOSinkNodeState::Initialized {
-                phase_channel_tx,
-                io_metrics,
-                ..
-            } = &mut self.state
-            else {
-                unreachable!()
-            };
-
-            if let Some(io_metrics) = io_metrics.as_ref() {
-                self.metrics_registry
-                    .register_io_metrics(io_metrics.clone())
-            }
-
-            if phase_channel_tx.send(phase_morsel_rx).await.is_err() {
                 let IOSinkNodeState::Initialized {
                     phase_channel_tx,
-                    task_handle,
-                    io_metrics: _,
-                } = std::mem::replace(&mut self.state, IOSinkNodeState::Finished)
+                    io_metrics,
+                    ..
+                } = &mut self.state
                 else {
                     unreachable!()
                 };
 
-                if self.verbose {
-                    eprintln!(
-                        "{}: Join on task_handle (phase_channel_tx Err)",
-                        self.name()
-                    );
+                if let Some(io_metrics) = io_metrics.as_ref() {
+                    self.metrics_registry
+                        .register_io_metrics(io_metrics.clone())
                 }
 
-                drop(phase_channel_tx);
+                if phase_channel_tx.send(phase_morsel_rx).await.is_err() {
+                    let IOSinkNodeState::Initialized {
+                        phase_channel_tx,
+                        task_handle,
+                        io_metrics: _,
+                    } = std::mem::replace(&mut self.state, IOSinkNodeState::Finished)
+                    else {
+                        unreachable!()
+                    };
 
-                return Err(task_handle.await.unwrap_err());
-            }
+                    if self.verbose {
+                        eprintln!(
+                            "{}: Join on task_handle (phase_channel_tx Err)",
+                            self.name()
+                        );
+                    }
 
-            Ok(())
-        }));
+                    drop(phase_channel_tx);
+
+                    return Err(task_handle.await.unwrap_err());
+                }
+
+                Ok(())
+            },
+        ));
     }
 }
 
@@ -215,20 +222,24 @@ impl IOSinkNodeState {
             SourceToken::default(),
         ));
 
-        executor::spawn(TaskPriority::High, async move {
-            let mut morsel_seq: u64 = 1;
+        executor::spawn(
+            TaskPriority::High,
+            execution_state.attribution.clone(),
+            async move {
+                let mut morsel_seq: u64 = 1;
 
-            while let Ok(mut phase_rx) = phase_channel_rx.recv().await {
-                while let Ok(mut morsel) = phase_rx.recv().await {
-                    morsel.set_seq(MorselSeq::new(morsel_seq));
-                    morsel_seq = morsel_seq.saturating_add(1);
+                while let Ok(mut phase_rx) = phase_channel_rx.recv().await {
+                    while let Ok(mut morsel) = phase_rx.recv().await {
+                        morsel.set_seq(MorselSeq::new(morsel_seq));
+                        morsel_seq = morsel_seq.saturating_add(1);
 
-                    if multi_phase_tx.send(morsel).await.is_err() {
-                        break;
+                        if multi_phase_tx.send(morsel).await.is_err() {
+                            break;
+                        }
                     }
                 }
-            }
-        });
+            },
+        );
 
         let task_handle = match &config.target {
             IOSinkTarget::File(_) => start_single_file_sink_pipeline(

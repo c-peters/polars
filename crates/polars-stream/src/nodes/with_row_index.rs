@@ -62,39 +62,47 @@ impl ComputeNode for WithRowIndexNode {
         let name = self.name.clone();
 
         // To figure out the correct offsets we need to be serial.
-        join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-            while let Ok(morsel) = receiver.recv().await {
-                let offset = self.offset;
-                self.offset = self
-                    .offset
-                    .checked_add(morsel.height().try_into().unwrap())
-                    .unwrap();
-                if distributor.send((morsel, offset)).await.is_err() {
-                    break;
+        join_handles.push(scope.spawn_task(
+            TaskPriority::High,
+            _state.attribution.clone(),
+            async move {
+                while let Ok(morsel) = receiver.recv().await {
+                    let offset = self.offset;
+                    self.offset = self
+                        .offset
+                        .checked_add(morsel.height().try_into().unwrap())
+                        .unwrap();
+                    if distributor.send((morsel, offset)).await.is_err() {
+                        break;
+                    }
                 }
-            }
 
-            Ok(())
-        }));
+                Ok(())
+            },
+        ));
 
         // But adding the new row index column can be done in parallel.
         for (mut send, mut recv) in senders.into_iter().zip(distr_receivers) {
             let name = name.clone();
-            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                let wait_group = WaitGroup::default();
-                while let Ok((morsel, offset)) = recv.recv().await {
-                    let mut morsel = morsel
-                        .try_map(|df| df.with_row_index(name.clone(), Some(offset)))
-                        .await?;
-                    morsel.set_consume_token(wait_group.token());
-                    if send.send(morsel).await.is_err() {
-                        break;
+            join_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                _state.attribution.clone(),
+                async move {
+                    let wait_group = WaitGroup::default();
+                    while let Ok((morsel, offset)) = recv.recv().await {
+                        let mut morsel = morsel
+                            .try_map(|df| df.with_row_index(name.clone(), Some(offset)))
+                            .await?;
+                        morsel.set_consume_token(wait_group.token());
+                        if send.send(morsel).await.is_err() {
+                            break;
+                        }
+                        wait_group.wait().await;
                     }
-                    wait_group.wait().await;
-                }
 
-                Ok(())
-            }));
+                    Ok(())
+                },
+            ));
         }
     }
 }

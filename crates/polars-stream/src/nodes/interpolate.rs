@@ -110,24 +110,28 @@ impl ComputeNode for InterpolateNode {
 
             let source_token = SourceToken::new();
             let mut send = send.serial();
-            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                let morsel_size = get_ideal_morsel_size();
-                while *pending_nulls > 0 && !source_token.stop_requested() {
-                    let chunk_size = morsel_size.min(*pending_nulls as usize);
-                    let df =
-                        Column::full_null(col_name.clone(), chunk_size, &output_dtype).into_frame();
-                    if send
-                        .send(Morsel::new_unregistered(df, *seq, source_token.clone()))
-                        .await
-                        .is_err()
-                    {
-                        break;
+            join_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                _state.attribution.clone(),
+                async move {
+                    let morsel_size = get_ideal_morsel_size();
+                    while *pending_nulls > 0 && !source_token.stop_requested() {
+                        let chunk_size = morsel_size.min(*pending_nulls as usize);
+                        let df = Column::full_null(col_name.clone(), chunk_size, &output_dtype)
+                            .into_frame();
+                        if send
+                            .send(Morsel::new_unregistered(df, *seq, source_token.clone()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        *seq = seq.successor();
+                        *pending_nulls -= chunk_size as IdxSize;
                     }
-                    *seq = seq.successor();
-                    *pending_nulls -= chunk_size as IdxSize;
-                }
-                Ok(())
-            }));
+                    Ok(())
+                },
+            ));
             return;
         };
 
@@ -138,98 +142,109 @@ impl ComputeNode for InterpolateNode {
             distributor_channel(senders.len(), *DEFAULT_DISTRIBUTOR_BUFFER_SIZE);
 
         // Serial receive and state handling thread.
-        join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-            while let Ok(morsel) = receiver.recv().await {
-                let (sf, _, source_token, _) = morsel.into_inner();
-                let mut columns = sf.into_df().await.into_columns();
-                assert_eq!(columns.len(), 1);
-                let column = columns.pop().unwrap();
-                let height = column.len();
+        join_handles.push(scope.spawn_task(
+            TaskPriority::High,
+            _state.attribution.clone(),
+            async move {
+                while let Ok(morsel) = receiver.recv().await {
+                    let (sf, _, source_token, _) = morsel.into_inner();
+                    let mut columns = sf.into_df().await.into_columns();
+                    assert_eq!(columns.len(), 1);
+                    let column = columns.pop().unwrap();
+                    let height = column.len();
 
-                let Some(last_non_null_idx) = column.last_non_null() else {
-                    // All nulls: accumulate into pending and wait for a right endpoint.
-                    *pending_nulls += height as IdxSize;
-                    continue;
-                };
+                    let Some(last_non_null_idx) = column.last_non_null() else {
+                        // All nulls: accumulate into pending and wait for a right endpoint.
+                        *pending_nulls += height as IdxSize;
+                        continue;
+                    };
 
-                // Everything until the last run of nulls is ready to be sent.
-                let ready_values = column.slice(0, last_non_null_idx + 1);
+                    // Everything until the last run of nulls is ready to be sent.
+                    let ready_values = column.slice(0, last_non_null_idx + 1);
 
-                if distributor
-                    .send((
-                        *seq,
-                        source_token,
-                        *pending_nulls,
-                        last_non_null.clone(),
-                        ready_values,
-                    ))
-                    .await
-                    .is_err()
-                {
-                    return Ok(());
+                    if distributor
+                        .send((
+                            *seq,
+                            source_token,
+                            *pending_nulls,
+                            last_non_null.clone(),
+                            ready_values,
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                    *seq = seq.successor();
+
+                    *last_non_null = column.get(last_non_null_idx).unwrap().into_static();
+                    *pending_nulls = (height - 1 - last_non_null_idx) as IdxSize;
                 }
-                *seq = seq.successor();
 
-                *last_non_null = column.get(last_non_null_idx).unwrap().into_static();
-                *pending_nulls = (height - 1 - last_non_null_idx) as IdxSize;
-            }
-
-            Ok(())
-        }));
+                Ok(())
+            },
+        ));
 
         // Parallel worker threads.
         for (mut send, mut recv) in senders.into_iter().zip(distr_receivers) {
             let input_dtype = input_dtype.clone();
             let output_dtype = output_dtype.clone();
-            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                let wait_group = WaitGroup::default();
-                while let Ok((seq, source_token, pending_nulls, last_non_null, mut column)) =
-                    recv.recv().await
-                {
-                    // Add back in the last non-null value and the pending nulls.
-                    //
-                    // If we have only seen nulls until now, last_non_null=Null and its just an
-                    // extra null at the start.
-                    let has_prepended = pending_nulls > 0 || !last_non_null.is_null();
-                    if has_prepended {
-                        let mut c = Column::new_scalar(
-                            column.name().clone(),
-                            Scalar::new(input_dtype.clone(), last_non_null),
-                            1,
+            join_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                _state.attribution.clone(),
+                async move {
+                    let wait_group = WaitGroup::default();
+                    while let Ok((seq, source_token, pending_nulls, last_non_null, mut column)) =
+                        recv.recv().await
+                    {
+                        // Add back in the last non-null value and the pending nulls.
+                        //
+                        // If we have only seen nulls until now, last_non_null=Null and its just an
+                        // extra null at the start.
+                        let has_prepended = pending_nulls > 0 || !last_non_null.is_null();
+                        if has_prepended {
+                            let mut c = Column::new_scalar(
+                                column.name().clone(),
+                                Scalar::new(input_dtype.clone(), last_non_null),
+                                1,
+                            );
+                            c.append_owned(Column::full_null(
+                                column.name().clone(),
+                                pending_nulls as usize,
+                                &input_dtype,
+                            ))?;
+                            c.append_owned(column)?;
+                            column = c;
+                        }
+
+                        // Interpolate if necessary.
+                        column = if column.has_nulls() {
+                            interpolate(column.as_materialized_series(), method).into_column()
+                        } else {
+                            column.cast(&output_dtype)?
+                        };
+
+                        // If there were pending nulls, we know that the previous morsel already
+                        // emitted our first value. We are only using it to enable interpolation here.
+                        // Slice it off and don't double emit it.
+                        if has_prepended {
+                            column = column.slice(1, usize::MAX);
+                        }
+
+                        let mut morsel = Morsel::new_unregistered(
+                            column.into_frame(),
+                            seq,
+                            source_token.clone(),
                         );
-                        c.append_owned(Column::full_null(
-                            column.name().clone(),
-                            pending_nulls as usize,
-                            &input_dtype,
-                        ))?;
-                        c.append_owned(column)?;
-                        column = c;
+                        morsel.set_consume_token(wait_group.token());
+                        if send.send(morsel).await.is_err() {
+                            break;
+                        }
+                        wait_group.wait().await;
                     }
-
-                    // Interpolate if necessary.
-                    column = if column.has_nulls() {
-                        interpolate(column.as_materialized_series(), method).into_column()
-                    } else {
-                        column.cast(&output_dtype)?
-                    };
-
-                    // If there were pending nulls, we know that the previous morsel already
-                    // emitted our first value. We are only using it to enable interpolation here.
-                    // Slice it off and don't double emit it.
-                    if has_prepended {
-                        column = column.slice(1, usize::MAX);
-                    }
-
-                    let mut morsel =
-                        Morsel::new_unregistered(column.into_frame(), seq, source_token.clone());
-                    morsel.set_consume_token(wait_group.token());
-                    if send.send(morsel).await.is_err() {
-                        break;
-                    }
-                    wait_group.wait().await;
-                }
-                Ok(())
-            }));
+                    Ok(())
+                },
+            ));
         }
     }
 }

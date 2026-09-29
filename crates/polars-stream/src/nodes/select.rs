@@ -63,40 +63,44 @@ impl ComputeNode for SelectNode {
 
         for (mut recv, mut send) in receivers.into_iter().zip(senders) {
             let slf = &*self;
-            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                while let Ok(morsel) = recv.recv().await {
-                    let (sf, seq, source_token, consume_token) = morsel.into_inner();
-                    let mut df = sf.into_df().await;
-                    if slf.rechunk_input {
-                        df.rechunk_mut();
+            join_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                state.attribution.clone(),
+                async move {
+                    while let Ok(morsel) = recv.recv().await {
+                        let (sf, seq, source_token, consume_token) = morsel.into_inner();
+                        let mut df = sf.into_df().await;
+                        if slf.rechunk_input {
+                            df.rechunk_mut();
+                        }
+
+                        let mut selected = Vec::new();
+                        for selector in slf.selectors.iter() {
+                            let s = selector.evaluate(&df, &state.in_memory_exec_state).await?;
+                            selected.push(s.into_column());
+                        }
+
+                        let ret = if slf.extend_original {
+                            let mut out = df;
+                            out.with_columns_mut(selected, &slf.schema)?;
+                            out
+                        } else {
+                            unsafe { DataFrame::new_unchecked_infer_broadcast(selected)? }
+                        };
+
+                        let mut morsel = Morsel::new_unregistered(ret, seq, source_token);
+                        if let Some(token) = consume_token {
+                            morsel.set_consume_token(token);
+                        }
+
+                        if send.send(morsel).await.is_err() {
+                            break;
+                        }
                     }
 
-                    let mut selected = Vec::new();
-                    for selector in slf.selectors.iter() {
-                        let s = selector.evaluate(&df, &state.in_memory_exec_state).await?;
-                        selected.push(s.into_column());
-                    }
-
-                    let ret = if slf.extend_original {
-                        let mut out = df;
-                        out.with_columns_mut(selected, &slf.schema)?;
-                        out
-                    } else {
-                        unsafe { DataFrame::new_unchecked_infer_broadcast(selected)? }
-                    };
-
-                    let mut morsel = Morsel::new_unregistered(ret, seq, source_token);
-                    if let Some(token) = consume_token {
-                        morsel.set_consume_token(token);
-                    }
-
-                    if send.send(morsel).await.is_err() {
-                        break;
-                    }
-                }
-
-                Ok(())
-            }));
+                    Ok(())
+                },
+            ));
         }
     }
 }

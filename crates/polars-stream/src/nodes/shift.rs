@@ -232,6 +232,9 @@ impl ComputeNode for ShiftNode {
                 send[0] = PortState::Blocked;
             },
             Self::Shifting(shift_state) => {
+                shift_state
+                    .spill_ctx
+                    .set_attribution(state.attribution.clone());
                 if recv[0] == PortState::Done && shift_state.rows_sent < shift_state.rows_received {
                     send[0] = PortState::Ready;
                 } else {
@@ -282,11 +285,23 @@ impl ComputeNode for ShiftNode {
                 let recv = recv_ports[0].take().map(|p| p.serial());
                 let send = send_ports[0].take().unwrap().serial();
                 join_handles.push(if shift_state.offset >= 0 {
-                    scope.spawn_task(TaskPriority::High, shift_state.shift_positive(recv, send))
+                    scope.spawn_task(
+                        TaskPriority::High,
+                        state.attribution.clone(),
+                        shift_state.shift_positive(recv, send),
+                    )
                 } else if let Some(r) = recv {
-                    scope.spawn_task(TaskPriority::High, shift_state.shift_negative(r, send))
+                    scope.spawn_task(
+                        TaskPriority::High,
+                        state.attribution.clone(),
+                        shift_state.shift_negative(r, send),
+                    )
                 } else {
-                    scope.spawn_task(TaskPriority::High, shift_state.flush_negative(send, state))
+                    scope.spawn_task(
+                        TaskPriority::High,
+                        state.attribution.clone(),
+                        shift_state.flush_negative(send, state),
+                    )
                 });
             },
             Self::Done => unreachable!(),

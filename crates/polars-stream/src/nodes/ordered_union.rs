@@ -83,35 +83,43 @@ impl ComputeNode for OrderedUnionNode {
         for (mut recv, mut send) in receivers.into_iter().zip(senders) {
             let output_schema = self.output_schema.clone();
             let morsel_offset = self.morsel_offset;
-            inner_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                let mut max_seq = MorselSeq::new(0);
-                while let Ok(mut morsel) = recv.recv().await {
-                    // Ensure the morsel matches the expected output schema,
-                    // casting nulls to the appropriate output type.
-                    morsel
-                        .df_mut()
-                        .await
-                        .ensure_matches_schema(&output_schema)?;
+            inner_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                _state.attribution.clone(),
+                async move {
+                    let mut max_seq = MorselSeq::new(0);
+                    while let Ok(mut morsel) = recv.recv().await {
+                        // Ensure the morsel matches the expected output schema,
+                        // casting nulls to the appropriate output type.
+                        morsel
+                            .df_mut()
+                            .await
+                            .ensure_matches_schema(&output_schema)?;
 
-                    // Ensure the morsel sequence id stream is monotonic.
-                    let seq = morsel.seq().offset_by(morsel_offset);
-                    max_seq = max_seq.max(seq);
+                        // Ensure the morsel sequence id stream is monotonic.
+                        let seq = morsel.seq().offset_by(morsel_offset);
+                        max_seq = max_seq.max(seq);
 
-                    morsel.set_seq(seq);
-                    if send.send(morsel).await.is_err() {
-                        break;
+                        morsel.set_seq(seq);
+                        if send.send(morsel).await.is_err() {
+                            break;
+                        }
                     }
-                }
-                PolarsResult::Ok(max_seq)
-            }));
+                    PolarsResult::Ok(max_seq)
+                },
+            ));
         }
 
-        join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-            // Update our global maximum.
-            for handle in inner_handles {
-                self.max_morsel_seq_sent = self.max_morsel_seq_sent.max(handle.await?);
-            }
-            Ok(())
-        }));
+        join_handles.push(scope.spawn_task(
+            TaskPriority::High,
+            _state.attribution.clone(),
+            async move {
+                // Update our global maximum.
+                for handle in inner_handles {
+                    self.max_morsel_seq_sent = self.max_morsel_seq_sent.max(handle.await?);
+                }
+                Ok(())
+            },
+        ));
     }
 }

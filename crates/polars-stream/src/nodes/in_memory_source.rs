@@ -94,34 +94,39 @@ impl ComputeNode for InMemorySourceNode {
         for mut send in senders {
             let slf = &*self;
             let source_token = source_token.clone();
-            join_handles.push(scope.spawn_task(TaskPriority::Low, async move {
-                let wait_group = WaitGroup::default();
-                loop {
-                    let seq = slf.seq.fetch_add(1, Ordering::Relaxed);
-                    let offset = (seq as usize * slf.morsel_size) as i64;
-                    let df = source.slice(offset, slf.morsel_size);
+            join_handles.push(scope.spawn_task(
+                TaskPriority::Low,
+                _state.attribution.clone(),
+                async move {
+                    let wait_group = WaitGroup::default();
+                    loop {
+                        let seq = slf.seq.fetch_add(1, Ordering::Relaxed);
+                        let offset = (seq as usize * slf.morsel_size) as i64;
+                        let df = source.slice(offset, slf.morsel_size);
 
-                    // TODO: remove this 'always sent at least one morsel'
-                    // condition, see update_state.
-                    if df.height() == 0 && seq > 0 {
-                        break;
+                        // TODO: remove this 'always sent at least one morsel'
+                        // condition, see update_state.
+                        if df.height() == 0 && seq > 0 {
+                            break;
+                        }
+
+                        let morsel_seq = MorselSeq::new(seq).offset_by(slf.seq_offset);
+                        let mut morsel =
+                            Morsel::new_unregistered(df, morsel_seq, source_token.clone());
+                        morsel.set_consume_token(wait_group.token());
+                        if send.send(morsel).await.is_err() {
+                            break;
+                        }
+
+                        wait_group.wait().await;
+                        if source_token.stop_requested() {
+                            break;
+                        }
                     }
 
-                    let morsel_seq = MorselSeq::new(seq).offset_by(slf.seq_offset);
-                    let mut morsel = Morsel::new_unregistered(df, morsel_seq, source_token.clone());
-                    morsel.set_consume_token(wait_group.token());
-                    if send.send(morsel).await.is_err() {
-                        break;
-                    }
-
-                    wait_group.wait().await;
-                    if source_token.stop_requested() {
-                        break;
-                    }
-                }
-
-                Ok(())
-            }));
+                    Ok(())
+                },
+            ));
         }
     }
 }

@@ -244,7 +244,7 @@ impl ComputeNode for MergeSortedNode {
         scope: &'s TaskScope<'s, 'env>,
         recv_ports: &mut [Option<RecvPort<'_>>],
         send_ports: &mut [Option<SendPort<'_>>],
-        _state: &'s StreamingExecutionState,
+        state: &'s StreamingExecutionState,
         join_handles: &mut Vec<JoinHandle<PolarsResult<()>>>,
     ) {
         assert_eq!(recv_ports.len(), 2);
@@ -267,7 +267,7 @@ impl ComputeNode for MergeSortedNode {
                 let recv = port.parallel();
                 join_handles.extend(recv.into_iter().zip(send).map(|(mut recv, mut send)| {
                     let seq = *seq;
-                    scope.spawn_task(TaskPriority::High, async move {
+                    scope.spawn_task(TaskPriority::High, state.attribution.clone(), async move {
                         while let Ok(mut morsel) = recv.recv().await {
                             // Ensure the morsel sequence id stream is monotone non-decreasing.
                             let seq = morsel.seq().offset_by(seq);
@@ -310,16 +310,83 @@ impl ComputeNode for MergeSortedNode {
                 let mut left = left.map(|p| p.serial());
                 let mut right = right.map(|p| p.serial());
 
-                join_handles.push(scope.spawn_task(TaskPriority::Low, async move {
-                    let source_token = SourceToken::new();
+                join_handles.push(scope.spawn_task(
+                    TaskPriority::Low,
+                    state.attribution.clone(),
+                    async move {
+                        let source_token = SourceToken::new();
 
-                    // While we can still load data for the empty side.
-                    while (left.is_some() || right.is_some())
-                        && !(left.is_none() && left_unmerged.is_empty())
-                        && !(right.is_none() && right_unmerged.is_empty())
-                    {
-                        // If we have morsels from both input ports, find until where we can merge
-                        // them and send that on to be merged.
+                        // While we can still load data for the empty side.
+                        while (left.is_some() || right.is_some())
+                            && !(left.is_none() && left_unmerged.is_empty())
+                            && !(right.is_none() && right_unmerged.is_empty())
+                        {
+                            // If we have morsels from both input ports, find until where we can merge
+                            // them and send that on to be merged.
+                            while let Some((left_mergeable, right_mergeable)) = find_mergeable(
+                                left_unmerged,
+                                right_unmerged,
+                                seq.to_u64() == 0,
+                                starting_nulls,
+                                maintain_order,
+                            )? {
+                                let left_mergeable = Morsel::new_unregistered(
+                                    left_mergeable,
+                                    *seq,
+                                    source_token.clone(),
+                                );
+                                *seq = seq.successor();
+
+                                if distributor
+                                    .send((left_mergeable, right_mergeable))
+                                    .await
+                                    .is_err()
+                                {
+                                    return Ok(());
+                                };
+                            }
+
+                            if source_token.stop_requested() {
+                                // Request that a port stops producing morsels and buffers all the
+                                // remaining morsels.
+                                if let Some(p) = &mut left {
+                                    buffer_unmerged(p, left_unmerged).await;
+                                }
+                                if let Some(p) = &mut right {
+                                    buffer_unmerged(p, right_unmerged).await;
+                                }
+                                break;
+                            }
+
+                            assert!(left_unmerged.is_empty() || right_unmerged.is_empty());
+                            let (empty_port, empty_unmerged) = match (
+                                left_unmerged.is_empty(),
+                                right_unmerged.is_empty(),
+                                left.as_mut(),
+                                right.as_mut(),
+                            ) {
+                                (true, _, Some(left), _) => (left, &mut *left_unmerged),
+                                (_, true, _, Some(right)) => (right, &mut *right_unmerged),
+
+                                // If the port that is empty is closed, we don't need to merge anymore.
+                                _ => break,
+                            };
+
+                            // Try to get a new morsel from the empty side.
+                            let Ok(m) = empty_port.recv().await else {
+                                if let Some(p) = &mut left {
+                                    buffer_unmerged(p, left_unmerged).await;
+                                }
+                                if let Some(p) = &mut right {
+                                    buffer_unmerged(p, right_unmerged).await;
+                                }
+                                break;
+                            };
+                            empty_unmerged.push_back(m.into_df().await);
+                        }
+
+                        // Clear out buffers until we cannot anymore. This helps allows us to go to the
+                        // parallel case faster.
                         while let Some((left_mergeable, right_mergeable)) = find_mergeable(
                             left_unmerged,
                             right_unmerged,
@@ -343,118 +410,58 @@ impl ComputeNode for MergeSortedNode {
                             };
                         }
 
-                        if source_token.stop_requested() {
-                            // Request that a port stops producing morsels and buffers all the
-                            // remaining morsels.
-                            if let Some(p) = &mut left {
-                                buffer_unmerged(p, left_unmerged).await;
-                            }
-                            if let Some(p) = &mut right {
-                                buffer_unmerged(p, right_unmerged).await;
-                            }
-                            break;
-                        }
-
-                        assert!(left_unmerged.is_empty() || right_unmerged.is_empty());
-                        let (empty_port, empty_unmerged) = match (
-                            left_unmerged.is_empty(),
-                            right_unmerged.is_empty(),
-                            left.as_mut(),
-                            right.as_mut(),
-                        ) {
-                            (true, _, Some(left), _) => (left, &mut *left_unmerged),
-                            (_, true, _, Some(right)) => (right, &mut *right_unmerged),
-
-                            // If the port that is empty is closed, we don't need to merge anymore.
-                            _ => break,
+                        // If one of the ports is done and does not have buffered data anymore, we
+                        // flush the data on the other side. After this point, this node just pipes
+                        // data through.
+                        let pass = if left.is_none() && left_unmerged.is_empty() {
+                            Some((right.as_mut(), &mut *right_unmerged))
+                        } else if right.is_none() && right_unmerged.is_empty() {
+                            Some((left.as_mut(), &mut *left_unmerged))
+                        } else {
+                            None
                         };
-
-                        // Try to get a new morsel from the empty side.
-                        let Ok(m) = empty_port.recv().await else {
-                            if let Some(p) = &mut left {
-                                buffer_unmerged(p, left_unmerged).await;
-                            }
-                            if let Some(p) = &mut right {
-                                buffer_unmerged(p, right_unmerged).await;
-                            }
-                            break;
-                        };
-                        empty_unmerged.push_back(m.into_df().await);
-                    }
-
-                    // Clear out buffers until we cannot anymore. This helps allows us to go to the
-                    // parallel case faster.
-                    while let Some((left_mergeable, right_mergeable)) = find_mergeable(
-                        left_unmerged,
-                        right_unmerged,
-                        seq.to_u64() == 0,
-                        starting_nulls,
-                        maintain_order,
-                    )? {
-                        let left_mergeable =
-                            Morsel::new_unregistered(left_mergeable, *seq, source_token.clone());
-                        *seq = seq.successor();
-
-                        if distributor
-                            .send((left_mergeable, right_mergeable))
-                            .await
-                            .is_err()
-                        {
-                            return Ok(());
-                        };
-                    }
-
-                    // If one of the ports is done and does not have buffered data anymore, we
-                    // flush the data on the other side. After this point, this node just pipes
-                    // data through.
-                    let pass = if left.is_none() && left_unmerged.is_empty() {
-                        Some((right.as_mut(), &mut *right_unmerged))
-                    } else if right.is_none() && right_unmerged.is_empty() {
-                        Some((left.as_mut(), &mut *left_unmerged))
-                    } else {
-                        None
-                    };
-                    if let Some((pass_port, pass_unmerged)) = pass {
-                        for df in std::mem::take(pass_unmerged) {
-                            let m = Morsel::new_unregistered(df, *seq, source_token.clone());
-                            *seq = seq.successor();
-                            if distributor.send((m, DataFrame::empty())).await.is_err() {
-                                return Ok(());
-                            }
-                        }
-
-                        // Start passing on the port that is still open.
-                        if let Some(pass_port) = pass_port {
-                            let Ok(mut m) = pass_port.recv().await else {
-                                return Ok(());
-                            };
-                            if source_token.stop_requested() {
-                                m.source_token().stop();
-                            }
-                            m.set_seq(*seq);
-                            *seq = seq.successor();
-                            if distributor.send((m, DataFrame::empty())).await.is_err() {
-                                return Ok(());
-                            }
-
-                            while let Ok(mut m) = pass_port.recv().await {
-                                m.set_seq(*seq);
+                        if let Some((pass_port, pass_unmerged)) = pass {
+                            for df in std::mem::take(pass_unmerged) {
+                                let m = Morsel::new_unregistered(df, *seq, source_token.clone());
                                 *seq = seq.successor();
                                 if distributor.send((m, DataFrame::empty())).await.is_err() {
                                     return Ok(());
                                 }
                             }
-                        }
-                    }
 
-                    Ok(())
-                }));
+                            // Start passing on the port that is still open.
+                            if let Some(pass_port) = pass_port {
+                                let Ok(mut m) = pass_port.recv().await else {
+                                    return Ok(());
+                                };
+                                if source_token.stop_requested() {
+                                    m.source_token().stop();
+                                }
+                                m.set_seq(*seq);
+                                *seq = seq.successor();
+                                if distributor.send((m, DataFrame::empty())).await.is_err() {
+                                    return Ok(());
+                                }
+
+                                while let Ok(mut m) = pass_port.recv().await {
+                                    m.set_seq(*seq);
+                                    *seq = seq.successor();
+                                    if distributor.send((m, DataFrame::empty())).await.is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+
+                        Ok(())
+                    },
+                ));
 
                 // Task that actually merges the two dataframes. Since this merge might be very
                 // expensive, this is split over several tasks.
                 join_handles.extend(dist_recv.into_iter().zip(send).map(|(mut recv, mut send)| {
                     let ideal_morsel_size = get_ideal_morsel_size();
-                    scope.spawn_task(TaskPriority::High, async move {
+                    scope.spawn_task(TaskPriority::High, state.attribution.clone(), async move {
                         let wait_group = WaitGroup::default();
                         while let Ok((mut left, mut right)) = recv.recv().await {
                             // When we are flushing the buffer, we will just send one morsel from

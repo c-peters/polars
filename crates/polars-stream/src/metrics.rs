@@ -356,16 +356,14 @@ impl TaskAttribution for NodeAttribution {
     }
 }
 
-/// Credits tasks spawned while the guard lives to `key` in `graph_metrics`.
-///
-/// Child tasks inherit the attribution, including tasks that outlive the phase.
+/// Returns explicit task ownership for `key` in this query.
 pub fn attribute_tasks_to_node(
     key: GraphNodeKey,
     graph_metrics: Option<&Arc<parking_lot::Mutex<GraphMetrics>>>,
-) -> polars_async::executor::AttributionGuard {
-    let attribution =
-        graph_metrics.map(|m| m.lock().node_attribution(key, m) as Arc<dyn TaskAttribution>);
-    polars_async::executor::scoped_task_attribution(attribution)
+) -> polars_async::executor::TaskAttributionHandle {
+    graph_metrics.map_or_else(Default::default, |m| {
+        polars_async::executor::TaskAttributionHandle::new(m.lock().node_attribution(key, m))
+    })
 }
 
 pub struct NodeMetricsRegistry {

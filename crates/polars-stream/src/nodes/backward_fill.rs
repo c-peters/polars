@@ -96,25 +96,30 @@ impl ComputeNode for BackwardFillNode {
 
             let pending = *pending_nulls;
             let mut send = send.serial();
-            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                let source_token = SourceToken::new();
-                let morsel_size = get_ideal_morsel_size();
-                let mut remaining = pending as usize;
-                while remaining > 0 {
-                    let chunk_size = morsel_size.min(remaining);
-                    let df = Column::full_null(col_name.clone(), chunk_size, &dtype).into_frame();
-                    if send
-                        .send(Morsel::new_unregistered(df, *seq, source_token.clone()))
-                        .await
-                        .is_err()
-                    {
-                        break;
+            join_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                _state.attribution.clone(),
+                async move {
+                    let source_token = SourceToken::new();
+                    let morsel_size = get_ideal_morsel_size();
+                    let mut remaining = pending as usize;
+                    while remaining > 0 {
+                        let chunk_size = morsel_size.min(remaining);
+                        let df =
+                            Column::full_null(col_name.clone(), chunk_size, &dtype).into_frame();
+                        if send
+                            .send(Morsel::new_unregistered(df, *seq, source_token.clone()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        *seq = seq.successor();
+                        remaining -= chunk_size;
                     }
-                    *seq = seq.successor();
-                    remaining -= chunk_size;
-                }
-                Ok(())
-            }));
+                    Ok(())
+                },
+            ));
 
             *pending_nulls = 0;
             return;
@@ -129,100 +134,108 @@ impl ComputeNode for BackwardFillNode {
         // Serial thread: handles serial state and sends morsel without backward_fill to parallel
         // workers.
         let serial_dtype = dtype.clone();
-        join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-            let dtype = serial_dtype;
-            let source_token = SourceToken::new();
-            let ideal_morsel_size = get_ideal_morsel_size() as IdxSize;
+        join_handles.push(scope.spawn_task(
+            TaskPriority::High,
+            _state.attribution.clone(),
+            async move {
+                let dtype = serial_dtype;
+                let source_token = SourceToken::new();
+                let ideal_morsel_size = get_ideal_morsel_size() as IdxSize;
 
-            while let Ok(morsel) = receiver.recv().await {
-                let df = morsel.df().await;
-                let column = &df[0];
-                let height = column.len();
-                if height == 0 {
-                    continue;
-                }
+                while let Ok(morsel) = receiver.recv().await {
+                    let df = morsel.df().await;
+                    let column = &df[0];
+                    let height = column.len();
+                    if height == 0 {
+                        continue;
+                    }
 
-                let null_count = column.null_count();
-                if null_count == height {
-                    *pending_nulls += height as IdxSize;
-                }
+                    let null_count = column.null_count();
+                    if null_count == height {
+                        *pending_nulls += height as IdxSize;
+                    }
 
-                // Flush pending nulls that exceed the limit as already-final null morsels.
-                // This also covers the all-null case above.
-                while *pending_nulls > limit {
-                    let chunk_size = ideal_morsel_size.min(*pending_nulls - limit);
-                    let col = Column::full_null(col_name.clone(), chunk_size as usize, &dtype);
-                    let null_morsel =
-                        Morsel::new_unregistered(col.into_frame(), *seq, source_token.clone());
+                    // Flush pending nulls that exceed the limit as already-final null morsels.
+                    // This also covers the all-null case above.
+                    while *pending_nulls > limit {
+                        let chunk_size = ideal_morsel_size.min(*pending_nulls - limit);
+                        let col = Column::full_null(col_name.clone(), chunk_size as usize, &dtype);
+                        let null_morsel =
+                            Morsel::new_unregistered(col.into_frame(), *seq, source_token.clone());
+
+                        *seq = seq.successor();
+                        *pending_nulls -= chunk_size;
+                        if distributor.send(null_morsel).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+
+                    if null_count == height {
+                        // Fast path: all nulls.
+                        continue;
+                    }
+
+                    let new_pending_nulls = if null_count == 0 {
+                        0
+                    } else {
+                        // Note: unwrap is fine as `null_count != height`.
+                        let trailing_nulls = height - column.last_non_null().unwrap() - 1;
+                        (trailing_nulls as IdxSize).min(limit)
+                    };
+
+                    let mut column = if new_pending_nulls > 0 {
+                        // Remove new pending nulls.
+                        column.slice(0, column.len() - new_pending_nulls as usize)
+                    } else {
+                        column.clone()
+                    };
+                    if *pending_nulls > 0 {
+                        // Prepend the old pending nulls.
+                        let mut c =
+                            Column::full_null(col_name.clone(), *pending_nulls as usize, &dtype);
+                        c.append_owned(column)?;
+                        column = c;
+                    }
+
+                    let morsel =
+                        Morsel::new_unregistered(column.into_frame(), *seq, source_token.clone());
 
                     *seq = seq.successor();
-                    *pending_nulls -= chunk_size;
-                    if distributor.send(null_morsel).await.is_err() {
+                    *pending_nulls = new_pending_nulls;
+                    if distributor.send(morsel).await.is_err() {
                         return Ok(());
                     }
                 }
 
-                if null_count == height {
-                    // Fast path: all nulls.
-                    continue;
-                }
-
-                let new_pending_nulls = if null_count == 0 {
-                    0
-                } else {
-                    // Note: unwrap is fine as `null_count != height`.
-                    let trailing_nulls = height - column.last_non_null().unwrap() - 1;
-                    (trailing_nulls as IdxSize).min(limit)
-                };
-
-                let mut column = if new_pending_nulls > 0 {
-                    // Remove new pending nulls.
-                    column.slice(0, column.len() - new_pending_nulls as usize)
-                } else {
-                    column.clone()
-                };
-                if *pending_nulls > 0 {
-                    // Prepend the old pending nulls.
-                    let mut c =
-                        Column::full_null(col_name.clone(), *pending_nulls as usize, &dtype);
-                    c.append_owned(column)?;
-                    column = c;
-                }
-
-                let morsel =
-                    Morsel::new_unregistered(column.into_frame(), *seq, source_token.clone());
-
-                *seq = seq.successor();
-                *pending_nulls = new_pending_nulls;
-                if distributor.send(morsel).await.is_err() {
-                    return Ok(());
-                }
-            }
-
-            Ok(())
-        }));
+                Ok(())
+            },
+        ));
 
         // Parallel worker threads: Apply fill null and emit.
         for (mut send, mut recv) in senders.into_iter().zip(distr_receivers) {
-            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                let wait_group = WaitGroup::default();
-                while let Ok(mut morsel) = recv.recv().await {
-                    let mut df = morsel.df_mut().await;
-                    if df[0].has_nulls() {
-                        *df = df[0]
-                            .fill_null(FillNullStrategy::Backward(Some(limit)))?
-                            .into_frame();
+            join_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                _state.attribution.clone(),
+                async move {
+                    let wait_group = WaitGroup::default();
+                    while let Ok(mut morsel) = recv.recv().await {
+                        let mut df = morsel.df_mut().await;
+                        if df[0].has_nulls() {
+                            *df = df[0]
+                                .fill_null(FillNullStrategy::Backward(Some(limit)))?
+                                .into_frame();
+                        }
+                        drop(df);
+                        morsel.set_consume_token(wait_group.token());
+                        if send.send(morsel).await.is_err() {
+                            break;
+                        }
+                        wait_group.wait().await;
                     }
-                    drop(df);
-                    morsel.set_consume_token(wait_group.token());
-                    if send.send(morsel).await.is_err() {
-                        break;
-                    }
-                    wait_group.wait().await;
-                }
 
-                Ok(())
-            }));
+                    Ok(())
+                },
+            ));
         }
     }
 }

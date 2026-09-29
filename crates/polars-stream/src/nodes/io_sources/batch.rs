@@ -174,6 +174,7 @@ impl FileReader for BatchFnReader {
         args: BeginReadArgs,
     ) -> PolarsResult<(FileReaderOutputRecv, JoinHandle<PolarsResult<()>>)> {
         let BeginReadArgs {
+            attribution,
             projection: _,
             row_index: None,
             pre_slice: None,
@@ -218,7 +219,7 @@ impl FileReader for BatchFnReader {
 
         let (mut morsel_sender, morsel_rx) = FileReaderOutputSend::new_serial();
 
-        let handle = spawn(TaskPriority::Low, async move {
+        let handle = spawn(TaskPriority::Low, attribution.clone(), async move {
             if let Some(file_schema_tx) = file_schema_tx {
                 let opt_df;
 

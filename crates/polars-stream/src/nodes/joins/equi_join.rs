@@ -580,11 +580,13 @@ impl SampleState {
         params.left_is_build = Some(left_is_build);
         let mut sampled_build_morsels = BufferedStream::new(
             "equi-join-left-sample".into(),
+            state.attribution.clone(),
             core::mem::take(&mut self.left),
             MorselSeq::default(),
         );
         let mut sampled_probe_morsels = BufferedStream::new(
             "equi-join-right-sample".into(),
+            state.attribution.clone(),
             core::mem::take(&mut self.right),
             MorselSeq::default(),
         );
@@ -605,12 +607,19 @@ impl SampleState {
             executor::task_scope(|scope| {
                 let mut join_handles = Vec::new();
                 let receivers = sampled_build_morsels
-                    .reinsert(state.num_pipelines, None, scope, &mut join_handles)
+                    .reinsert(
+                        state.num_pipelines,
+                        state.attribution.clone(),
+                        None,
+                        scope,
+                        &mut join_handles,
+                    )
                     .unwrap();
 
                 for (local_builder, recv) in build_state.local_builders.iter_mut().zip(receivers) {
                     join_handles.push(scope.spawn_task(
                         TaskPriority::High,
+                        state.attribution.clone(),
                         BuildState::partition_and_sink(
                             recv,
                             local_builder,
@@ -860,7 +869,12 @@ impl BuildState {
         }
     }
 
-    fn finalize_unordered(&mut self, params: &EquiJoinParams, table: &dyn IdxTable) -> ProbeState {
+    fn finalize_unordered(
+        &mut self,
+        attribution: polars_async::executor::TaskAttributionHandle,
+        params: &EquiJoinParams,
+        table: &dyn IdxTable,
+    ) -> ProbeState {
         let track_unmatchable = params.emit_unmatched_build();
         let payload_schema = if params.left_is_build.unwrap() {
             &params.left_payload_schema
@@ -893,84 +907,92 @@ impl BuildState {
                 let morsel_drop_q_send = morsel_drop_q_send.clone();
                 let morsel_drop_q_recv = morsel_drop_q_recv.clone();
                 let probe_tables = &probe_tables;
-                join_handles.push(s.spawn_task(TaskPriority::High, async move {
-                    // Extract from outer arc and drop outer arc.
-                    let morsels_per_local_builder =
-                        Arc::unwrap_or_clone(arc_morsels_per_local_builder);
+                join_handles.push(s.spawn_task(
+                    TaskPriority::High,
+                    attribution.clone(),
+                    async move {
+                        // Extract from outer arc and drop outer arc.
+                        let morsels_per_local_builder =
+                            Arc::unwrap_or_clone(arc_morsels_per_local_builder);
 
-                    // Compute cardinality estimate and total amount of
-                    // payload for this partition.
-                    let mut sketch = CardinalitySketch::new();
-                    let mut payload_rows = 0;
-                    for l in local_builders {
-                        sketch.combine(&l.sketch_per_p[p]);
-                        let offsets_len = l.morsel_idxs_offsets_per_p.len();
-                        payload_rows +=
-                            l.morsel_idxs_offsets_per_p[offsets_len - num_partitions + p];
-                    }
-
-                    // Allocate hash table and payload builder.
-                    let mut p_table = table.new_empty();
-                    p_table.reserve(sketch.estimate() * 5 / 4);
-                    let mut p_payload = DataFrameBuilder::new(payload_schema.clone());
-                    p_payload.reserve(payload_rows);
-
-                    // Build.
-                    let mut skip_drop_attempt = false;
-                    for (l, l_morsels) in local_builders.iter().zip(morsels_per_local_builder) {
-                        // Try to help with dropping the processed morsels.
-                        if !skip_drop_attempt {
-                            drop(morsel_drop_q_recv.try_recv());
+                        // Compute cardinality estimate and total amount of
+                        // payload for this partition.
+                        let mut sketch = CardinalitySketch::new();
+                        let mut payload_rows = 0;
+                        for l in local_builders {
+                            sketch.combine(&l.sketch_per_p[p]);
+                            let offsets_len = l.morsel_idxs_offsets_per_p.len();
+                            payload_rows +=
+                                l.morsel_idxs_offsets_per_p[offsets_len - num_partitions + p];
                         }
 
-                        for (i, morsel) in l_morsels.iter().enumerate() {
-                            let (_mseq, sf, keys) = morsel;
-                            let payload = sf.get().await;
-                            unsafe {
-                                let p_morsel_idxs_start =
-                                    l.morsel_idxs_offsets_per_p[i * num_partitions + p];
-                                let p_morsel_idxs_stop =
-                                    l.morsel_idxs_offsets_per_p[(i + 1) * num_partitions + p];
-                                let p_morsel_idxs = &l.morsel_idxs_values_per_p[p]
-                                    [p_morsel_idxs_start..p_morsel_idxs_stop];
-                                p_table.insert_keys_subset(keys, p_morsel_idxs, track_unmatchable);
-                                p_payload.gather_extend(
-                                    &payload,
-                                    p_morsel_idxs,
-                                    ShareStrategy::Never,
-                                );
+                        // Allocate hash table and payload builder.
+                        let mut p_table = table.new_empty();
+                        p_table.reserve(sketch.estimate() * 5 / 4);
+                        let mut p_payload = DataFrameBuilder::new(payload_schema.clone());
+                        p_payload.reserve(payload_rows);
+
+                        // Build.
+                        let mut skip_drop_attempt = false;
+                        for (l, l_morsels) in local_builders.iter().zip(morsels_per_local_builder) {
+                            // Try to help with dropping the processed morsels.
+                            if !skip_drop_attempt {
+                                drop(morsel_drop_q_recv.try_recv());
+                            }
+
+                            for (i, morsel) in l_morsels.iter().enumerate() {
+                                let (_mseq, sf, keys) = morsel;
+                                let payload = sf.get().await;
+                                unsafe {
+                                    let p_morsel_idxs_start =
+                                        l.morsel_idxs_offsets_per_p[i * num_partitions + p];
+                                    let p_morsel_idxs_stop =
+                                        l.morsel_idxs_offsets_per_p[(i + 1) * num_partitions + p];
+                                    let p_morsel_idxs = &l.morsel_idxs_values_per_p[p]
+                                        [p_morsel_idxs_start..p_morsel_idxs_stop];
+                                    p_table.insert_keys_subset(
+                                        keys,
+                                        p_morsel_idxs,
+                                        track_unmatchable,
+                                    );
+                                    p_payload.gather_extend(
+                                        &payload,
+                                        p_morsel_idxs,
+                                        ShareStrategy::Never,
+                                    );
+                                }
+                            }
+
+                            if let Some(l) = Arc::into_inner(l_morsels) {
+                                // If we're the last thread to process this set of morsels we're probably
+                                // falling behind the rest, since the drop can be quite expensive we skip
+                                // a drop attempt hoping someone else will pick up the slack.
+                                drop(morsel_drop_q_send.try_send(l));
+                                skip_drop_attempt = true;
+                            } else {
+                                skip_drop_attempt = false;
                             }
                         }
 
-                        if let Some(l) = Arc::into_inner(l_morsels) {
-                            // If we're the last thread to process this set of morsels we're probably
-                            // falling behind the rest, since the drop can be quite expensive we skip
-                            // a drop attempt hoping someone else will pick up the slack.
-                            drop(morsel_drop_q_send.try_send(l));
-                            skip_drop_attempt = true;
-                        } else {
-                            skip_drop_attempt = false;
+                        // We're done, help others out by doing drops.
+                        drop(morsel_drop_q_send); // So we don't deadlock trying to receive from ourselves.
+                        while let Ok(l_morsels) = morsel_drop_q_recv.recv().await {
+                            drop(l_morsels);
                         }
-                    }
 
-                    // We're done, help others out by doing drops.
-                    drop(morsel_drop_q_send); // So we don't deadlock trying to receive from ourselves.
-                    while let Ok(l_morsels) = morsel_drop_q_recv.recv().await {
-                        drop(l_morsels);
-                    }
-
-                    probe_tables
-                        .try_set(
-                            p,
-                            ProbeTable {
-                                hash_table: p_table,
-                                payload: p_payload.freeze(),
-                                row_positions: Vec::new(),
-                            },
-                        )
-                        .ok()
-                        .unwrap();
-                }));
+                        probe_tables
+                            .try_set(
+                                p,
+                                ProbeTable {
+                                    hash_table: p_table,
+                                    payload: p_payload.freeze(),
+                                    row_positions: Vec::new(),
+                                },
+                            )
+                            .ok()
+                            .unwrap();
+                    },
+                ));
             }
 
             // Drop outer arc after spawning each thread so the inner arcs
@@ -1571,6 +1593,7 @@ impl ComputeNode for EquiJoinNode {
         send: &mut [PortState],
         state: &StreamingExecutionState,
     ) -> PolarsResult<()> {
+        self.spill_ctx.set_attribution(state.attribution.clone());
         assert!(recv.len() == 2 && send.len() == 1);
 
         // If the output doesn't want any more data, transition to being done.
@@ -1608,7 +1631,11 @@ impl ComputeNode for EquiJoinNode {
                 } else if self.params.preserve_order_build {
                     EquiJoinState::Probe(build_state.finalize_ordered(&self.params, &*self.table))
                 } else {
-                    EquiJoinState::Probe(build_state.finalize_unordered(&self.params, &*self.table))
+                    EquiJoinState::Probe(build_state.finalize_unordered(
+                        state.attribution.clone(),
+                        &self.params,
+                        &*self.table,
+                    ))
                 };
             }
         }
@@ -1751,6 +1778,7 @@ impl ComputeNode for EquiJoinNode {
                 if let Some(left_recv) = recv_ports[0].take() {
                     join_handles.push(scope.spawn_task(
                         TaskPriority::High,
+                        state.attribution.clone(),
                         sample_sink(
                             left_recv.serial(),
                             &mut sample_state.left,
@@ -1764,6 +1792,7 @@ impl ComputeNode for EquiJoinNode {
                 if let Some(right_recv) = recv_ports[1].take() {
                     join_handles.push(scope.spawn_task(
                         TaskPriority::High,
+                        state.attribution.clone(),
                         sample_sink(
                             right_recv.serial(),
                             &mut sample_state.right,
@@ -1784,6 +1813,7 @@ impl ComputeNode for EquiJoinNode {
                 for (local_builder, recv) in build_state.local_builders.iter_mut().zip(receivers) {
                     join_handles.push(scope.spawn_task(
                         TaskPriority::High,
+                        state.attribution.clone(),
                         BuildState::partition_and_sink(
                             recv,
                             local_builder,
@@ -1802,6 +1832,7 @@ impl ComputeNode for EquiJoinNode {
                     .sampled_probe_morsels
                     .reinsert(
                         state.num_pipelines,
+                        state.attribution.clone(),
                         recv_ports[probe_idx].take(),
                         scope,
                         join_handles,
@@ -1815,6 +1846,7 @@ impl ComputeNode for EquiJoinNode {
                     .map(|(recv, send)| {
                         scope.spawn_task(
                             TaskPriority::High,
+                            state.attribution.clone(),
                             ProbeState::partition_and_probe(
                                 recv,
                                 send,
@@ -1829,12 +1861,16 @@ impl ComputeNode for EquiJoinNode {
                     .collect_vec();
 
                 let max_seq_sent = &mut probe_state.max_seq_sent;
-                join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                    for probe_task in probe_tasks {
-                        *max_seq_sent = (*max_seq_sent).max(probe_task.await?);
-                    }
-                    Ok(())
-                }));
+                join_handles.push(scope.spawn_task(
+                    TaskPriority::High,
+                    state.attribution.clone(),
+                    async move {
+                        for probe_task in probe_tasks {
+                            *max_seq_sent = (*max_seq_sent).max(probe_task.await?);
+                        }
+                        Ok(())
+                    },
+                ));
             },
             EquiJoinState::EmitUnmatchedBuild(emit_state) => {
                 assert!(recv_ports[build_idx].is_none());
@@ -1842,6 +1878,7 @@ impl ComputeNode for EquiJoinNode {
                 let send = send_ports[0].take().unwrap().serial();
                 join_handles.push(scope.spawn_task(
                     TaskPriority::Low,
+                    state.attribution.clone(),
                     emit_state.emit_unmatched(send, &self.params, state.num_pipelines),
                 ));
             },

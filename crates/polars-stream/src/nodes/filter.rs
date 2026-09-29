@@ -49,44 +49,48 @@ impl ComputeNode for FilterNode {
         for (mut recv, mut send) in receivers.into_iter().zip(senders) {
             let slf = &*self;
 
-            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                while let Ok(morsel) = recv.recv().await {
-                    let morsel = morsel
-                        .async_try_map(|mut df| async move {
-                            let mask = slf
-                                .predicate
-                                .evaluate(&df, &state.in_memory_exec_state)
-                                .await?;
-                            let mask = column_to_mask(&mask, df.height())?;
+            join_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                state.attribution.clone(),
+                async move {
+                    while let Ok(morsel) = recv.recv().await {
+                        let morsel = morsel
+                            .async_try_map(|mut df| async move {
+                                let mask = slf
+                                    .predicate
+                                    .evaluate(&df, &state.in_memory_exec_state)
+                                    .await?;
+                                let mask = column_to_mask(&mask, df.height())?;
 
-                            if let Some(projection) = slf.projection.as_deref() {
-                                df = unsafe {
-                                    DataFrame::new_unchecked(
-                                        df.height(),
-                                        projection
-                                            .iter()
-                                            .map(|&i| df.columns()[i].clone())
-                                            .collect(),
-                                    )
+                                if let Some(projection) = slf.projection.as_deref() {
+                                    df = unsafe {
+                                        DataFrame::new_unchecked(
+                                            df.height(),
+                                            projection
+                                                .iter()
+                                                .map(|&i| df.columns()[i].clone())
+                                                .collect(),
+                                        )
+                                    }
                                 }
-                            }
 
-                            // We already parallelize, call the sequential filter.
-                            df.filter_seq(mask.as_ref())
-                        })
-                        .await?;
+                                // We already parallelize, call the sequential filter.
+                                df.filter_seq(mask.as_ref())
+                            })
+                            .await?;
 
-                    if morsel.height() == 0 {
-                        continue;
+                        if morsel.height() == 0 {
+                            continue;
+                        }
+
+                        if send.send(morsel).await.is_err() {
+                            break;
+                        }
                     }
 
-                    if send.send(morsel).await.is_err() {
-                        break;
-                    }
-                }
-
-                Ok(())
-            }));
+                    Ok(())
+                },
+            ));
         }
     }
 }

@@ -81,6 +81,7 @@ impl FileWriterStarter for IpcWriterStarter {
 
     fn start_file_writer(
         &self,
+        attribution: polars_async::executor::TaskAttributionHandle,
         morsel_rx: connector::Receiver<SinkMorsel>,
         file: FileOpenTaskHandle,
         num_pipelines: std::num::NonZeroUsize,
@@ -95,7 +96,7 @@ impl FileWriterStarter for IpcWriterStarter {
 
         let finish_record_batch_write_wg = WaitGroup::default();
 
-        let handle = executor::spawn(TaskPriority::High, async move {
+        let handle = executor::spawn(TaskPriority::High, attribution.clone(), async move {
             let (ipc_batch_tx, ipc_batch_rx) = tokio::sync::mpsc::channel::<(
                 executor::AbortOnDropHandle<PolarsResult<IpcBatch>>,
                 Option<WaitToken>,
@@ -122,7 +123,9 @@ impl FileWriterStarter for IpcWriterStarter {
 
             let record_batch_encoder_handle = executor::AbortOnDropHandle::new(executor::spawn(
                 TaskPriority::High,
+                attribution.clone(),
                 record_batch_encoder::RecordBatchEncoder {
+                    attribution: attribution.clone(),
                     morsel_rx,
                     ipc_batch_tx,
                     arrow_converters,

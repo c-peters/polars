@@ -50,6 +50,9 @@ impl ComputeNode for MultiplexerNode {
         // is no longer interested as closed.
         self.buffers.resize_with(send.len(), BufferedStream::new);
         for (s, b) in send.iter().zip(&mut self.buffers) {
+            if let BufferedStream::Open(_, ctx) = b {
+                ctx.set_attribution(_state.attribution.clone());
+            }
             if *s == PortState::Done {
                 *b = BufferedStream::Closed;
             }
@@ -143,54 +146,58 @@ impl ComputeNode for MultiplexerNode {
         // TODO: parallel multiplexing.
         if let Some(mut receiver) = recv_ports[0].take().map(|r| r.serial()) {
             let buffered_source_token = buffered_source_token.clone();
-            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                loop {
-                    let Ok(mut morsel) = receiver.recv().await else {
-                        break;
-                    };
-                    drop(morsel.take_consume_token());
+            join_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                _state.attribution.clone(),
+                async move {
+                    loop {
+                        let Ok(mut morsel) = receiver.recv().await else {
+                            break;
+                        };
+                        drop(morsel.take_consume_token());
 
-                    let mut anyone_interested = false;
-                    let mut active_listener_interested = false;
-                    let seq = morsel.seq();
-                    for buf_sender in &mut buf_senders {
-                        match buf_sender {
-                            Listener::Active(s, ctx) => {
-                                let source_token = morsel.source_token().clone();
-                                let sf = morsel.sf().clone();
-                                ctx.register(&sf).await;
-                                match s.send((sf, seq, source_token)) {
-                                    Ok(_) => {
-                                        anyone_interested = true;
-                                        active_listener_interested = true;
-                                    },
-                                    Err(_) => *buf_sender = Listener::Inactive,
-                                }
-                            },
-                            Listener::Buffering(b, ctx) => {
-                                let sf = morsel.sf().clone();
-                                ctx.register(&sf).await;
-                                b.push_front((sf, seq));
-                                anyone_interested = true;
-                            },
-                            Listener::Inactive => {},
+                        let mut anyone_interested = false;
+                        let mut active_listener_interested = false;
+                        let seq = morsel.seq();
+                        for buf_sender in &mut buf_senders {
+                            match buf_sender {
+                                Listener::Active(s, ctx) => {
+                                    let source_token = morsel.source_token().clone();
+                                    let sf = morsel.sf().clone();
+                                    ctx.register(&sf).await;
+                                    match s.send((sf, seq, source_token)) {
+                                        Ok(_) => {
+                                            anyone_interested = true;
+                                            active_listener_interested = true;
+                                        },
+                                        Err(_) => *buf_sender = Listener::Inactive,
+                                    }
+                                },
+                                Listener::Buffering(b, ctx) => {
+                                    let sf = morsel.sf().clone();
+                                    ctx.register(&sf).await;
+                                    b.push_front((sf, seq));
+                                    anyone_interested = true;
+                                },
+                                Listener::Inactive => {},
+                            }
+                        }
+
+                        if !anyone_interested {
+                            break;
+                        }
+
+                        // If only buffering inputs are left, or we got a stop
+                        // request from an input reading from old buffered data,
+                        // request a stop from the source.
+                        if !active_listener_interested || buffered_source_token.stop_requested() {
+                            morsel.source_token().stop();
                         }
                     }
 
-                    if !anyone_interested {
-                        break;
-                    }
-
-                    // If only buffering inputs are left, or we got a stop
-                    // request from an input reading from old buffered data,
-                    // request a stop from the source.
-                    if !active_listener_interested || buffered_source_token.stop_requested() {
-                        morsel.source_token().stop();
-                    }
-                }
-
-                Ok(())
-            }));
+                    Ok(())
+                },
+            ));
         }
 
         for (send_port, opt_buf_recv) in send_ports.iter_mut().zip(buf_receivers) {
@@ -199,39 +206,43 @@ impl ComputeNode for MultiplexerNode {
 
                 let wait_group = WaitGroup::default();
                 let buffered_source_token = buffered_source_token.clone();
-                join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                    // First we try to flush all the old buffered data.
-                    while let Some((sf, seq)) = buf.pop_back() {
-                        let mut morsel = Morsel::new(sf, seq, buffered_source_token.clone());
-                        morsel.set_consume_token(wait_group.token());
-                        if sender.send(morsel).await.is_err() {
-                            return Ok(());
-                        }
-
-                        // Someone wants to stop, flush remainder into buffer.
-                        if buffered_source_token.stop_requested() {
-                            drop(sender);
-                            while let Some((sf, seq, source_token)) = rx.recv().await {
-                                source_token.stop();
-                                buf.push_front((sf, seq));
+                join_handles.push(scope.spawn_task(
+                    TaskPriority::High,
+                    _state.attribution.clone(),
+                    async move {
+                        // First we try to flush all the old buffered data.
+                        while let Some((sf, seq)) = buf.pop_back() {
+                            let mut morsel = Morsel::new(sf, seq, buffered_source_token.clone());
+                            morsel.set_consume_token(wait_group.token());
+                            if sender.send(morsel).await.is_err() {
+                                return Ok(());
                             }
-                            return Ok(());
+
+                            // Someone wants to stop, flush remainder into buffer.
+                            if buffered_source_token.stop_requested() {
+                                drop(sender);
+                                while let Some((sf, seq, source_token)) = rx.recv().await {
+                                    source_token.stop();
+                                    buf.push_front((sf, seq));
+                                }
+                                return Ok(());
+                            }
+
+                            wait_group.wait().await;
                         }
 
-                        wait_group.wait().await;
-                    }
-
-                    // Then send along data from the multiplexer.
-                    while let Some((sf, seq, source_token)) = rx.recv().await {
-                        let mut morsel = Morsel::new(sf, seq, source_token);
-                        morsel.set_consume_token(wait_group.token());
-                        if sender.send(morsel).await.is_err() {
-                            return Ok(());
+                        // Then send along data from the multiplexer.
+                        while let Some((sf, seq, source_token)) = rx.recv().await {
+                            let mut morsel = Morsel::new(sf, seq, source_token);
+                            morsel.set_consume_token(wait_group.token());
+                            if sender.send(morsel).await.is_err() {
+                                return Ok(());
+                            }
+                            wait_group.wait().await;
                         }
-                        wait_group.wait().await;
-                    }
-                    Ok(())
-                }));
+                        Ok(())
+                    },
+                ));
             }
         }
     }

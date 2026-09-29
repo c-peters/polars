@@ -12,6 +12,7 @@ use crate::nodes::io_sources::multi_scan::components::bridge::{
 use crate::pipe::PortSender;
 
 pub fn spawn_bridge(
+    attribution: polars_async::executor::TaskAttributionHandle,
     bridge_state: Arc<Mutex<BridgeState>>,
 ) -> (
     JoinHandle<()>,
@@ -25,6 +26,7 @@ pub fn spawn_bridge(
 
     let handle = executor::spawn(
         TaskPriority::Low,
+        attribution.clone(),
         Bridge {
             incoming,
             outgoing,

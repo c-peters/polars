@@ -73,21 +73,25 @@ impl ComputeNode for UnorderedUnionNode {
 
                 for (mut receiver, sender) in receivers.into_iter().zip(mpsc_senders_clone) {
                     let output_schema = self.output_schema.clone();
-                    join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                        while let Ok(mut morsel) = receiver.recv().await {
-                            // Ensure the morsel matches the expected output schema,
-                            // casting nulls to the appropriate output type.
-                            morsel
-                                .df_mut()
-                                .await
-                                .ensure_matches_schema(&output_schema)?;
+                    join_handles.push(scope.spawn_task(
+                        TaskPriority::High,
+                        state.attribution.clone(),
+                        async move {
+                            while let Ok(mut morsel) = receiver.recv().await {
+                                // Ensure the morsel matches the expected output schema,
+                                // casting nulls to the appropriate output type.
+                                morsel
+                                    .df_mut()
+                                    .await
+                                    .ensure_matches_schema(&output_schema)?;
 
-                            if sender.send(morsel).await.is_err() {
-                                break;
+                                if sender.send(morsel).await.is_err() {
+                                    break;
+                                }
                             }
-                        }
-                        PolarsResult::Ok(())
-                    }));
+                            PolarsResult::Ok(())
+                        },
+                    ));
                 }
             }
         }
@@ -115,30 +119,38 @@ impl ComputeNode for UnorderedUnionNode {
         for (lane_idx, (mut mpsc_receiver, mut output_sender)) in
             mpsc_receivers.into_iter().zip(output_senders).enumerate()
         {
-            inner_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                let mut local_seq = morsel_offset.offset_by_u64(lane_idx as u64);
-                let seq_step = num_pipelines as u64;
-                let mut max_seq = MorselSeq::new(0);
+            inner_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                state.attribution.clone(),
+                async move {
+                    let mut local_seq = morsel_offset.offset_by_u64(lane_idx as u64);
+                    let seq_step = num_pipelines as u64;
+                    let mut max_seq = MorselSeq::new(0);
 
-                while let Some(mut morsel) = mpsc_receiver.recv().await {
-                    morsel.set_seq(local_seq);
-                    max_seq = max_seq.max(local_seq);
-                    local_seq = local_seq.offset_by_u64(seq_step);
+                    while let Some(mut morsel) = mpsc_receiver.recv().await {
+                        morsel.set_seq(local_seq);
+                        max_seq = max_seq.max(local_seq);
+                        local_seq = local_seq.offset_by_u64(seq_step);
 
-                    if output_sender.send(morsel).await.is_err() {
-                        break;
+                        if output_sender.send(morsel).await.is_err() {
+                            break;
+                        }
                     }
-                }
 
-                PolarsResult::Ok(max_seq)
-            }));
+                    PolarsResult::Ok(max_seq)
+                },
+            ));
         }
 
-        join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-            for handle in inner_handles {
-                self.max_morsel_seq_sent = self.max_morsel_seq_sent.max(handle.await?);
-            }
-            Ok(())
-        }));
+        join_handles.push(scope.spawn_task(
+            TaskPriority::High,
+            state.attribution.clone(),
+            async move {
+                for handle in inner_handles {
+                    self.max_morsel_seq_sent = self.max_morsel_seq_sent.max(handle.await?);
+                }
+                Ok(())
+            },
+        ));
     }
 }

@@ -66,54 +66,62 @@ impl ComputeNode for GatherEveryNode {
         let n = self.n;
 
         // To figure out the correct offsets we need to be serial.
-        join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-            while let Ok(morsel) = receiver.recv().await {
-                let height = morsel.height();
-                if self.offset >= height {
-                    self.offset -= height;
-                    continue;
-                }
+        join_handles.push(scope.spawn_task(
+            TaskPriority::High,
+            _state.attribution.clone(),
+            async move {
+                while let Ok(morsel) = receiver.recv().await {
+                    let height = morsel.height();
+                    if self.offset >= height {
+                        self.offset -= height;
+                        continue;
+                    }
 
-                if distributor.send((morsel, self.offset)).await.is_err() {
-                    break;
-                }
-
-                // Calculates `offset = (offset - height) mod n` without under- and overflow.
-                self.offset += height.next_multiple_of(self.n) - height;
-                self.offset %= self.n;
-            }
-
-            Ok(())
-        }));
-
-        // But gathering the column can be done in parallel.
-        for (mut send, mut recv) in senders.into_iter().zip(distr_receivers) {
-            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                let wait_group = WaitGroup::default();
-                while let Ok((morsel, offset)) = recv.recv().await {
-                    let mut morsel = morsel
-                        .try_map(|mut df| {
-                            let column = &df.columns()[0];
-                            let out = column
-                                .gather_every(n, offset)?
-                                .with_name(column.name().clone());
-                            unsafe {
-                                let height = out.len();
-                                df.columns_mut_retain_schema()[0] = out;
-                                df.set_height(height);
-                            };
-                            PolarsResult::Ok(df)
-                        })
-                        .await?;
-                    morsel.set_consume_token(wait_group.token());
-                    if send.send(morsel).await.is_err() {
+                    if distributor.send((morsel, self.offset)).await.is_err() {
                         break;
                     }
-                    wait_group.wait().await;
+
+                    // Calculates `offset = (offset - height) mod n` without under- and overflow.
+                    self.offset += height.next_multiple_of(self.n) - height;
+                    self.offset %= self.n;
                 }
 
                 Ok(())
-            }));
+            },
+        ));
+
+        // But gathering the column can be done in parallel.
+        for (mut send, mut recv) in senders.into_iter().zip(distr_receivers) {
+            join_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                _state.attribution.clone(),
+                async move {
+                    let wait_group = WaitGroup::default();
+                    while let Ok((morsel, offset)) = recv.recv().await {
+                        let mut morsel = morsel
+                            .try_map(|mut df| {
+                                let column = &df.columns()[0];
+                                let out = column
+                                    .gather_every(n, offset)?
+                                    .with_name(column.name().clone());
+                                unsafe {
+                                    let height = out.len();
+                                    df.columns_mut_retain_schema()[0] = out;
+                                    df.set_height(height);
+                                };
+                                PolarsResult::Ok(df)
+                            })
+                            .await?;
+                        morsel.set_consume_token(wait_group.token());
+                        if send.send(morsel).await.is_err() {
+                            break;
+                        }
+                        wait_group.wait().await;
+                    }
+
+                    Ok(())
+                },
+            ));
         }
     }
 }

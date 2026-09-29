@@ -127,6 +127,7 @@ impl DeletionFilesProvider {
 
     pub fn spawn_row_deletions_init(
         &self,
+        attribution: polars_async::executor::TaskAttributionHandle,
         scan_source_idx: usize,
         cloud_options: Option<Arc<CloudOptions>>,
         num_pipelines: usize,
@@ -159,6 +160,7 @@ impl DeletionFilesProvider {
                     )
                 }
 
+                let init_attribution = attribution.clone();
                 let deletion_files_init_fut: Pin<
                     Box<dyn Future<Output = PolarsResult<ExternalFilterMask>> + Send>,
                 > = match paths {
@@ -186,6 +188,7 @@ impl DeletionFilesProvider {
 
                                 AbortOnDropHandle::new(executor::spawn(
                                     TaskPriority::Low,
+                                    attribution.clone(),
                                     async move {
                                         reader.initialize().await?;
                                         PolarsResult::Ok(reader)
@@ -210,6 +213,7 @@ impl DeletionFilesProvider {
                                     use crate::nodes::io_sources::multi_scan::components::projection::Projection;
 
                                     let begin_read_args = BeginReadArgs {
+                                        attribution: init_attribution.clone(),
                                         projection: Projection::Plain(projected_schema.clone()),
                                         row_index: None,
                                         pre_slice: None,
@@ -228,7 +232,7 @@ impl DeletionFilesProvider {
                                 };
 
                                 AbortOnDropHandle::new(executor::spawn(
-                                    TaskPriority::Low,
+                                    TaskPriority::Low, init_attribution.clone(),
                                     async move {
                                         let mut reader = init_fut.await?;
 
@@ -356,8 +360,10 @@ impl DeletionFilesProvider {
                     },
                 };
 
-                let handle =
-                    AbortOnDropHandle::new(executor::spawn(TaskPriority::Low, async move {
+                let handle = AbortOnDropHandle::new(executor::spawn(
+                    TaskPriority::Low,
+                    attribution.clone(),
+                    async move {
                         let mask = deletion_files_init_fut.await?;
 
                         if verbose {
@@ -373,7 +379,8 @@ impl DeletionFilesProvider {
                         }
 
                         Ok(mask)
-                    }));
+                    },
+                ));
 
                 Some(RowDeletionsInit::Initializing(handle))
             },
@@ -388,8 +395,10 @@ impl DeletionFilesProvider {
                 let provider = provider.clone();
                 let selected_paths = selected_paths.clone();
 
-                let handle =
-                    AbortOnDropHandle::new(executor::spawn(TaskPriority::Low, async move {
+                let handle = AbortOnDropHandle::new(executor::spawn(
+                    TaskPriority::Low,
+                    attribution.clone(),
+                    async move {
                         let deletion_vectors = cache
                             .get_or_try_init(|| async {
                                 let provider = provider.clone();
@@ -425,7 +434,8 @@ impl DeletionFilesProvider {
                         };
 
                         Ok(ExternalFilterMask::DeltaDeletionVector { mask })
-                    }));
+                    },
+                ));
 
                 Some(RowDeletionsInit::Initializing(handle))
             },

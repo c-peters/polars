@@ -24,6 +24,7 @@ pub trait FileWriterStarter: Send + Sync + 'static {
 
     fn start_file_writer(
         &self,
+        attribution: polars_async::executor::TaskAttributionHandle,
         morsel_rx: connector::Receiver<SinkMorsel>,
         file: FileOpenTaskHandle,
         num_pipelines: NonZeroUsize,

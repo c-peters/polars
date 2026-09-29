@@ -92,44 +92,48 @@ impl ComputeNode for CallbackSinkNode {
             .unwrap()
             .serial_with_maintain_order(self.maintain_order);
 
-        join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-            while !self.is_done
-                && let Ok(m) = recv.recv().await
-            {
-                let (sf, _, _, consume_token) = m.into_inner();
-
-                // @NOTE: This also performs schema validation.
-                self.buffer.vstack_mut_owned(sf.into_df().await)?;
-
-                while self.buffer.height() > 0
-                    && self
-                        .chunk_size
-                        .is_none_or(|chunk_size| self.buffer.height() >= chunk_size.get())
+        join_handles.push(scope.spawn_task(
+            TaskPriority::High,
+            _state.attribution.clone(),
+            async move {
+                while !self.is_done
+                    && let Ok(m) = recv.recv().await
                 {
-                    let chunk_size = self.chunk_size.map_or(usize::MAX, Into::into);
+                    let (sf, _, _, consume_token) = m.into_inner();
 
-                    let df;
-                    (df, self.buffer) = self
-                        .buffer
-                        .split_at(self.buffer.height().min(chunk_size) as i64);
+                    // @NOTE: This also performs schema validation.
+                    self.buffer.vstack_mut_owned(sf.into_df().await)?;
 
-                    let function = self.function.clone();
-                    let should_stop = ASYNC
-                        .spawn_blocking(move || function.call(df))
-                        .await
-                        .unwrap()?;
+                    while self.buffer.height() > 0
+                        && self
+                            .chunk_size
+                            .is_none_or(|chunk_size| self.buffer.height() >= chunk_size.get())
+                    {
+                        let chunk_size = self.chunk_size.map_or(usize::MAX, Into::into);
 
-                    if should_stop {
-                        self.is_done = true;
-                        break;
+                        let df;
+                        (df, self.buffer) = self
+                            .buffer
+                            .split_at(self.buffer.height().min(chunk_size) as i64);
+
+                        let function = self.function.clone();
+                        let should_stop = ASYNC
+                            .spawn_blocking(move || function.call(df))
+                            .await
+                            .unwrap()?;
+
+                        if should_stop {
+                            self.is_done = true;
+                            break;
+                        }
                     }
+                    drop(consume_token);
+                    // Increase the backpressure. Only free up a pipeline when the morsel has been
+                    // processed in its entirety.
                 }
-                drop(consume_token);
-                // Increase the backpressure. Only free up a pipeline when the morsel has been
-                // processed in its entirety.
-            }
 
-            Ok(())
-        }));
+                Ok(())
+            },
+        ));
     }
 }

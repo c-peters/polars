@@ -58,10 +58,14 @@ pub trait FileReader: Send + Sync {
     ///
     /// Note: The default implementation of this dispatches to `begin_read`, so should not be
     /// called from there.
-    async fn n_rows_in_file(&mut self) -> PolarsResult<IdxSize> {
+    async fn n_rows_in_file(
+        &mut self,
+        attribution: polars_async::executor::TaskAttributionHandle,
+    ) -> PolarsResult<IdxSize> {
         let (tx, rx) = oneshot_channel::channel();
 
         let (morsel_receivers, handle) = self.begin_read(BeginReadArgs {
+            attribution: attribution.clone(),
             // Passing 0-0 slice indicates to the reader that we want the full row count, but it can
             // skip actually reading the data if it is able to.
             pre_slice: Some(Slice::Positive { offset: 0, len: 0 }),
@@ -91,15 +95,17 @@ pub trait FileReader: Send + Sync {
     /// This is essentially `n_rows_in_file`, but potentially with early stopping.
     async fn row_position_after_slice(
         &mut self,
+        attribution: polars_async::executor::TaskAttributionHandle,
         pre_slice: Option<Slice>,
     ) -> PolarsResult<IdxSize> {
         let Some(pre_slice) = pre_slice else {
-            return self.n_rows_in_file().await;
+            return self.n_rows_in_file(attribution.clone()).await;
         };
 
         let (tx, rx) = oneshot_channel::channel();
 
         let (mut morsel_receivers, handle) = self.begin_read(BeginReadArgs {
+            attribution: attribution.clone(),
             pre_slice: Some(match pre_slice {
                 // Normalize positive slices, as some row-skipping codepaths are single-threaded (e.g. NDJSON).
                 v @ Slice::Positive { .. } => Slice::Positive {
@@ -134,6 +140,7 @@ pub trait FileReader: Send + Sync {
 
 #[derive(Debug)]
 pub struct BeginReadArgs {
+    pub attribution: polars_async::executor::TaskAttributionHandle,
     /// Columns to project from the file.
     pub projection: Projection,
 
@@ -168,6 +175,7 @@ pub struct BeginReadArgs {
 impl Default for BeginReadArgs {
     fn default() -> Self {
         BeginReadArgs {
+            attribution: Default::default(),
             projection: Projection::Plain(SchemaRef::default()),
             row_index: None,
             pre_slice: None,

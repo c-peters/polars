@@ -99,22 +99,26 @@ impl ComputeNode for GatherNode {
                 for (mut recv, mut send) in receivers.into_iter().zip(senders) {
                     let null_on_oob = self.null_on_oob;
                     let input = &*input;
-                    join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                        while let Ok(morsel) = recv.recv().await {
-                            let morsel = morsel
-                                .try_map(|idx_df| {
-                                    assert!(idx_df.width() == 1);
-                                    input.gather_with_column(&idx_df.columns()[0], null_on_oob)
-                                })
-                                .await?;
+                    join_handles.push(scope.spawn_task(
+                        TaskPriority::High,
+                        state.attribution.clone(),
+                        async move {
+                            while let Ok(morsel) = recv.recv().await {
+                                let morsel = morsel
+                                    .try_map(|idx_df| {
+                                        assert!(idx_df.width() == 1);
+                                        input.gather_with_column(&idx_df.columns()[0], null_on_oob)
+                                    })
+                                    .await?;
 
-                            if send.send(morsel).await.is_err() {
-                                break;
+                                if send.send(morsel).await.is_err() {
+                                    break;
+                                }
                             }
-                        }
 
-                        Ok(())
-                    }));
+                            Ok(())
+                        },
+                    ));
                 }
             },
             GatherState::Done => unreachable!(),

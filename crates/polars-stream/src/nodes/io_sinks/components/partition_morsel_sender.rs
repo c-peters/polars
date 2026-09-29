@@ -17,6 +17,7 @@ use crate::nodes::io_sinks::components::size::{
 };
 
 pub struct PartitionMorselSender {
+    pub attribution: polars_async::executor::TaskAttributionHandle,
     /// Note: Must be <= `file_size_limit` if there is one.
     pub target_sink_morsel_size: TargetSinkMorselSize,
     pub file_size_limit: NonZeroRowCountAndSize,
@@ -106,6 +107,7 @@ impl PartitionMorselSender {
                     if let Ok(permit) = self.open_sinks_semaphore.clone().try_acquire_owned() {
                         executor::spawn(
                             TaskPriority::Low,
+                            self.attribution.clone(),
                             self.error_capture.clone().wrap_future(handle),
                         );
 

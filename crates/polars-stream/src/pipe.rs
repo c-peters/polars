@@ -244,6 +244,7 @@ impl PhysicalPipe {
     pub fn spawn<'env, 's>(
         &'env mut self,
         scope: &'s TaskScope<'s, 'env>,
+        attribution: polars_async::executor::TaskAttributionHandle,
         handles: &mut Vec<JoinHandle<PolarsResult<()>>>,
     ) {
         match core::mem::replace(&mut self.state, State::Initialized) {
@@ -270,35 +271,43 @@ impl PhysicalPipe {
                     );
 
                 let seq_offset = self.seq_offset.load();
-                handles.push(scope.spawn_task(TaskPriority::High, async move {
-                    while let Some(Priority(_, mut morsel)) = linearizer.get().await {
-                        morsel.set_seq(morsel.seq().offset_by_u64(seq_offset));
-                        if send.0.send(morsel).await.is_err() {
-                            break;
-                        }
-                    }
-
-                    Ok(())
-                }));
-
-                for (mut recv, mut inserter) in receivers.into_iter().zip(inserters) {
-                    handles.push(scope.spawn_task(TaskPriority::High, async move {
-                        while let Ok(mut morsel) = recv.0.recv().await {
-                            // Drop the consume token, but only after the send has succeeded. This
-                            // ensures we have backpressure, but only once the channel fills up.
-                            let consume_token = morsel.take_consume_token();
-                            if inserter
-                                .insert(Priority(Reverse(morsel.seq()), morsel))
-                                .await
-                                .is_err()
-                            {
+                handles.push(scope.spawn_task(
+                    TaskPriority::High,
+                    attribution.clone(),
+                    async move {
+                        while let Some(Priority(_, mut morsel)) = linearizer.get().await {
+                            morsel.set_seq(morsel.seq().offset_by_u64(seq_offset));
+                            if send.0.send(morsel).await.is_err() {
                                 break;
                             }
-                            drop(consume_token);
                         }
 
                         Ok(())
-                    }));
+                    },
+                ));
+
+                for (mut recv, mut inserter) in receivers.into_iter().zip(inserters) {
+                    handles.push(scope.spawn_task(
+                        TaskPriority::High,
+                        attribution.clone(),
+                        async move {
+                            while let Ok(mut morsel) = recv.0.recv().await {
+                                // Drop the consume token, but only after the send has succeeded. This
+                                // ensures we have backpressure, but only once the channel fills up.
+                                let consume_token = morsel.take_consume_token();
+                                if inserter
+                                    .insert(Priority(Reverse(morsel.seq()), morsel))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                drop(consume_token);
+                            }
+
+                            Ok(())
+                        },
+                    ));
                 }
             },
 
@@ -310,44 +319,56 @@ impl PhysicalPipe {
                     self.seq_offset.clone(),
                 );
 
-                handles.push(scope.spawn_task(TaskPriority::High, async move {
-                    while let Ok(morsel) = recv.0.recv().await {
-                        if distributor.send((morsel, ())).await.is_err() {
-                            break;
-                        }
-                    }
-
-                    Ok(())
-                }));
-
-                for (mut send, mut recv) in senders.into_iter().zip(distr_receivers) {
-                    handles.push(scope.spawn_task(TaskPriority::High, async move {
-                        let wait_group = WaitGroup::default();
-                        while let Ok((mut morsel, ())) = recv.recv().await {
-                            morsel.set_consume_token(wait_group.token());
-                            if send.0.send(morsel).await.is_err() {
+                handles.push(scope.spawn_task(
+                    TaskPriority::High,
+                    attribution.clone(),
+                    async move {
+                        while let Ok(morsel) = recv.0.recv().await {
+                            if distributor.send((morsel, ())).await.is_err() {
                                 break;
                             }
-                            wait_group.wait().await;
                         }
 
                         Ok(())
-                    }));
+                    },
+                ));
+
+                for (mut send, mut recv) in senders.into_iter().zip(distr_receivers) {
+                    handles.push(scope.spawn_task(
+                        TaskPriority::High,
+                        attribution.clone(),
+                        async move {
+                            let wait_group = WaitGroup::default();
+                            while let Ok((mut morsel, ())) = recv.recv().await {
+                                morsel.set_consume_token(wait_group.token());
+                                if send.0.send(morsel).await.is_err() {
+                                    break;
+                                }
+                                wait_group.wait().await;
+                            }
+
+                            Ok(())
+                        },
+                    ));
                 }
             },
 
             State::NeedsOffset { senders, receivers } => {
                 let seq_offset = self.seq_offset.load();
                 for (mut send, mut recv) in senders.into_iter().zip(receivers) {
-                    handles.push(scope.spawn_task(TaskPriority::High, async move {
-                        while let Ok(mut morsel) = recv.0.recv().await {
-                            morsel.set_seq(morsel.seq().offset_by_u64(seq_offset));
-                            if send.0.send(morsel).await.is_err() {
-                                break;
+                    handles.push(scope.spawn_task(
+                        TaskPriority::High,
+                        attribution.clone(),
+                        async move {
+                            while let Ok(mut morsel) = recv.0.recv().await {
+                                morsel.set_seq(morsel.seq().offset_by_u64(seq_offset));
+                                if send.0.send(morsel).await.is_err() {
+                                    break;
+                                }
                             }
-                        }
-                        Ok(())
-                    }));
+                            Ok(())
+                        },
+                    ));
                 }
             },
         }

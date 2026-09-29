@@ -18,6 +18,7 @@ use crate::nodes::io_sinks::components::sink_morsel::SinkMorsel;
 use crate::nodes::io_sinks::writers::parquet::EncodedRowGroup;
 
 pub struct RowGroupEncoder {
+    pub attribution: polars_async::executor::TaskAttributionHandle,
     pub morsel_rx: connector::Receiver<SinkMorsel>,
     pub encoded_row_group_tx:
         tokio::sync::mpsc::Sender<executor::AbortOnDropHandle<PolarsResult<EncodedRowGroup>>>,
@@ -32,6 +33,7 @@ pub struct RowGroupEncoder {
 impl RowGroupEncoder {
     pub async fn run(self) -> PolarsResult<()> {
         let RowGroupEncoder {
+            attribution,
             mut morsel_rx,
             encoded_row_group_tx,
             arrow_schema,
@@ -46,8 +48,11 @@ impl RowGroupEncoder {
             let schema_descriptor = Arc::clone(&schema_descriptor);
             let encodings = Buffer::clone(&encodings);
 
-            let row_group_encode_handle =
-                executor::AbortOnDropHandle::new(executor::spawn(TaskPriority::High, async move {
+            let attribution = attribution.clone();
+            let row_group_encode_handle = executor::AbortOnDropHandle::new(executor::spawn(
+                TaskPriority::High,
+                attribution.clone(),
+                async move {
                     let (df, morsel_permit) = morsel.into_inner();
                     let num_rows = df.height();
 
@@ -55,6 +60,7 @@ impl RowGroupEncoder {
 
                     for fut in parallelize_first_to_local(
                         TaskPriority::High,
+                        attribution.clone(),
                         df.into_columns().into_iter().enumerate().map(|(i, c)| {
                             let arrow_schema = Arc::clone(&arrow_schema);
                             let schema_descriptor = Arc::clone(&schema_descriptor);
@@ -108,7 +114,8 @@ impl RowGroupEncoder {
                         data,
                         morsel_permit,
                     })
-                }));
+                },
+            ));
 
             if encoded_row_group_tx
                 .send(row_group_encode_handle)

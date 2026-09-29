@@ -45,16 +45,20 @@ impl ComputeNode for MapNode {
 
         for (mut recv, mut send) in receivers.into_iter().zip(senders) {
             let slf = &*self;
-            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                while let Ok(morsel) = recv.recv().await {
-                    let morsel = morsel.try_map(|df| slf.map.call_udf(df)).await?;
-                    if send.send(morsel).await.is_err() {
-                        break;
+            join_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                _state.attribution.clone(),
+                async move {
+                    while let Ok(morsel) = recv.recv().await {
+                        let morsel = morsel.try_map(|df| slf.map.call_udf(df)).await?;
+                        if send.send(morsel).await.is_err() {
+                            break;
+                        }
                     }
-                }
 
-                Ok(())
-            }));
+                    Ok(())
+                },
+            ));
         }
     }
 }

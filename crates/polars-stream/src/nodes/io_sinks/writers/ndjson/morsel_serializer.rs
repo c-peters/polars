@@ -10,6 +10,7 @@ use crate::nodes::io_sinks::components::par_utils::rechunk_par;
 use crate::nodes::io_sinks::components::sink_morsel::{SinkMorsel, SinkMorselPermit};
 
 pub struct MorselSerializerPipeline {
+    pub attribution: polars_async::executor::TaskAttributionHandle,
     pub morsel_rx: connector::Receiver<SinkMorsel>,
     pub filled_serializer_tx: tokio::sync::mpsc::Sender<(
         executor::AbortOnDropHandle<PolarsResult<MorselSerializer>>,
@@ -23,6 +24,7 @@ pub struct MorselSerializerPipeline {
 impl MorselSerializerPipeline {
     pub async fn run(self) {
         let MorselSerializerPipeline {
+            attribution,
             mut morsel_rx,
             filled_serializer_tx,
             mut reuse_serializer_rx,
@@ -39,6 +41,7 @@ impl MorselSerializerPipeline {
                 } else if num_created_serializers < max_serializers {
                     num_created_serializers += 1;
                     MorselSerializer {
+                        attribution: attribution.clone(),
                         serialized_data: vec![],
                         allocation_size: base_allocation_size,
                     }
@@ -52,6 +55,7 @@ impl MorselSerializerPipeline {
 
             let handle = executor::AbortOnDropHandle::new(executor::spawn(
                 TaskPriority::High,
+                attribution.clone(),
                 morsel_serializer.serialize_morsel(df),
             ));
 
@@ -67,6 +71,7 @@ impl MorselSerializerPipeline {
 }
 
 pub struct MorselSerializer {
+    pub attribution: polars_async::executor::TaskAttributionHandle,
     pub serialized_data: Vec<u8>,
     allocation_size: usize,
 }
@@ -74,11 +79,16 @@ pub struct MorselSerializer {
 impl MorselSerializer {
     pub async fn serialize_morsel(mut self, mut df: DataFrame) -> PolarsResult<Self> {
         let MorselSerializer {
+            attribution,
             serialized_data,
             allocation_size,
         } = &mut self;
 
-        rechunk_par(unsafe { df.columns_mut_retain_schema() }).await;
+        rechunk_par(
+            unsafe { df.columns_mut_retain_schema() },
+            attribution.clone(),
+        )
+        .await;
 
         serialized_data.clear();
         serialized_data.reserve_exact(*allocation_size);

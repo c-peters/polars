@@ -202,6 +202,7 @@ impl FileReader for IpcFileReader {
         } = self.init_data.clone().unwrap();
 
         let BeginReadArgs {
+            attribution,
             projection: Projection::Plain(projected_schema),
             row_index,
             pre_slice: pre_slice_arg,
@@ -459,6 +460,7 @@ impl FileReader for IpcFileReader {
         }));
 
         // Receives fetched record batches and synchronizes row position, then calls decode.
+        let decode_attribution = attribution.clone();
         let decode_dispatch_task = AbortOnDropHandle(ASYNC.spawn(async move {
             let mut current_row_offset: IdxSize = 0;
 
@@ -490,11 +492,19 @@ impl FileReader for IpcFileReader {
                     SplitSlicePosition::Before => continue,
                     SplitSlicePosition::Overlapping(rows_offset, rows_len) => {
                         let record_batch_decoder = record_batch_decoder.clone();
-                        let decode_fut = executor::spawn(TaskPriority::High, async move {
-                            record_batch_decoder
-                                .record_batch_data_to_df(record_batch_data, rows_offset, rows_len)
-                                .await
-                        });
+                        let decode_fut = executor::spawn(
+                            TaskPriority::High,
+                            decode_attribution.clone(),
+                            async move {
+                                record_batch_decoder
+                                    .record_batch_data_to_df(
+                                        record_batch_data,
+                                        rows_offset,
+                                        rows_len,
+                                    )
+                                    .await
+                            },
+                        );
                         if decode_send.send((decode_fut, permit)).await.is_err() {
                             break;
                         }
@@ -512,84 +522,85 @@ impl FileReader for IpcFileReader {
         //
         // `last_morsel_pipelines` is precomputed at the multi-scan layer so the split budget is
         // shared across files in the scan.
-        let distribute_task = executor::spawn(TaskPriority::High, async move {
-            let mut morsel_seq = MorselSeq::default();
-            // Note: We don't use this (it is handled by the bridge). But morsels require a source token.
-            let source_token = SourceToken::new();
+        let distribute_task =
+            executor::spawn(TaskPriority::High, attribution.clone(), async move {
+                let mut morsel_seq = MorselSeq::default();
+                // Note: We don't use this (it is handled by the bridge). But morsels require a source token.
+                let source_token = SourceToken::new();
 
-            // Decode first non-empty morsel.
-            let mut next = None;
-            loop {
-                let Some((decode_fut, permit)) = decode_recv.recv().await else {
-                    break;
-                };
-                let df = decode_fut.await?;
-                if df.height() == 0 {
-                    continue;
-                }
-
-                if disable_morsel_split {
-                    if morsel_send
-                        .send_morsel(Morsel::new_unregistered(
-                            df,
-                            morsel_seq,
-                            source_token.clone(),
-                        ))
-                        .await
-                        .is_err()
-                    {
-                        return Ok(());
-                    }
-                    drop(permit);
-                    morsel_seq = morsel_seq.successor();
-                    continue;
-                }
-
-                next = Some((df, permit));
-                break;
-            }
-
-            while let Some((df, permit)) = next.take() {
-                // Try to decode the next non-empty morsel first, so we know
-                // whether the df is the last morsel.
-
-                // Important: Drop this before awaiting the next one, or could
-                // deadlock if the permit limit is 1.
-                drop(permit);
+                // Decode first non-empty morsel.
+                let mut next = None;
                 loop {
                     let Some((decode_fut, permit)) = decode_recv.recv().await else {
                         break;
                     };
-                    let next_df = decode_fut.await?;
-                    if next_df.height() == 0 {
+                    let df = decode_fut.await?;
+                    if df.height() == 0 {
                         continue;
                     }
-                    next = Some((next_df, permit));
+
+                    if disable_morsel_split {
+                        if morsel_send
+                            .send_morsel(Morsel::new_unregistered(
+                                df,
+                                morsel_seq,
+                                source_token.clone(),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                        drop(permit);
+                        morsel_seq = morsel_seq.successor();
+                        continue;
+                    }
+
+                    next = Some((df, permit));
                     break;
                 }
 
-                for df in split_to_morsels(
-                    &df,
-                    ideal_morsel_size,
-                    next.is_none(),
-                    last_morsel_pipelines,
-                ) {
-                    if morsel_send
-                        .send_morsel(Morsel::new_unregistered(
-                            df,
-                            morsel_seq,
-                            source_token.clone(),
-                        ))
-                        .await
-                        .is_err()
-                    {
-                        return Ok(());
+                while let Some((df, permit)) = next.take() {
+                    // Try to decode the next non-empty morsel first, so we know
+                    // whether the df is the last morsel.
+
+                    // Important: Drop this before awaiting the next one, or could
+                    // deadlock if the permit limit is 1.
+                    drop(permit);
+                    loop {
+                        let Some((decode_fut, permit)) = decode_recv.recv().await else {
+                            break;
+                        };
+                        let next_df = decode_fut.await?;
+                        if next_df.height() == 0 {
+                            continue;
+                        }
+                        next = Some((next_df, permit));
+                        break;
                     }
-                    morsel_seq = morsel_seq.successor();
+
+                    for df in split_to_morsels(
+                        &df,
+                        ideal_morsel_size,
+                        next.is_none(),
+                        last_morsel_pipelines,
+                    ) {
+                        if morsel_send
+                            .send_morsel(Morsel::new_unregistered(
+                                df,
+                                morsel_seq,
+                                source_token.clone(),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                        morsel_seq = morsel_seq.successor();
+                    }
                 }
-            }
-            PolarsResult::Ok(())
-        });
+                PolarsResult::Ok(())
+            });
 
         // Orchestration.
         let join_task = ASYNC.spawn(async move {
@@ -603,7 +614,9 @@ impl FileReader for IpcFileReader {
 
         Ok((
             morsel_recv,
-            executor::spawn(TaskPriority::Low, async move { handle.await.unwrap() }),
+            executor::spawn(TaskPriority::Low, attribution.clone(), async move {
+                handle.await.unwrap()
+            }),
         ))
     }
 }

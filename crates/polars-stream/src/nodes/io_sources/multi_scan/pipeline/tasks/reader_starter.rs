@@ -35,6 +35,7 @@ use crate::nodes::io_sources::multi_scan::reader_interface::{
 
 /// Starts readers, potentially multiple at the same time if it can.
 pub struct ReaderStarter {
+    pub attribution: polars_async::executor::TaskAttributionHandle,
     pub reader_capabilities: ReaderCapabilities,
     pub readers_init_iter: BoxStream<'static, PolarsResult<InitializedReaderState>>,
     pub n_sources: usize,
@@ -60,6 +61,7 @@ pub struct InitializedReaderState {
 impl ReaderStarter {
     pub async fn run(self) -> PolarsResult<()> {
         let ReaderStarter {
+            attribution,
             reader_capabilities,
             mut readers_init_iter,
             n_sources,
@@ -275,8 +277,9 @@ impl ReaderStarter {
                     }
 
                     let get_row_count = async {
-                        let num_physical_rows =
-                            reader.row_position_after_slice(pre_slice_this_file).await?;
+                        let num_physical_rows = reader
+                            .row_position_after_slice(attribution.clone(), pre_slice_this_file)
+                            .await?;
 
                         let num_deleted_rows = external_filter_mask.as_ref().map_or(0, |mask| {
                             mask.slice(
@@ -339,7 +342,12 @@ impl ReaderStarter {
 
             let reader_start_task_handle = AbortOnDropHandle::new(executor::spawn(
                 TaskPriority::Low,
-                start_reader_impl(constant_args.clone(), start_args_this_file),
+                attribution.clone(),
+                start_reader_impl(
+                    attribution.clone(),
+                    constant_args.clone(),
+                    start_args_this_file,
+                ),
             ));
 
             if started_reader_tx
@@ -406,6 +414,7 @@ impl ReaderStarter {
 
 /// This function gets run in a spawned task to avoid blocking the ReaderStarter's loop.
 async fn start_reader_impl(
+    attribution: polars_async::executor::TaskAttributionHandle,
     constant_args: StartReaderArgsConstant,
     args_this_file: StartReaderArgsPerFile,
 ) -> PolarsResult<StartedReaderState> {
@@ -610,6 +619,7 @@ async fn start_reader_impl(
     }
 
     let begin_read_args = BeginReadArgs {
+        attribution: attribution.clone(),
         projection: projection_to_reader,
         row_index,
         pre_slice,
@@ -688,6 +698,7 @@ async fn start_reader_impl(
             let first_morsel = first_morsel.unwrap();
 
             let (rx, handle) = PostApplyExtraOps {
+                attribution: attribution.clone(),
                 reader_output_port,
                 ops_applier,
                 first_morsel,

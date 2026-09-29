@@ -122,9 +122,10 @@ impl Graph {
 
             {
                 // State updates can spawn tasks, e.g. equi-join partition builds.
-                let _attribution = attribute_tasks_to_node(node_key, metrics);
+                let mut state = state.clone();
+                state.attribution = attribute_tasks_to_node(node_key, metrics);
                 node.compute
-                    .update_state(&mut recv_state, &mut send_state, state)?;
+                    .update_state(&mut recv_state, &mut send_state, &state)?;
             }
             let elapsed = start.map(|s| s.elapsed());
             if let Some(lock) = metrics {

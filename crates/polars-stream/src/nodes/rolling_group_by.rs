@@ -242,32 +242,36 @@ impl ComputeNode for RollingGroupBy {
             assert!(self.buf_df.height() > 0);
             assert!(self.slice_length > 0);
             let mut send = send_ports[0].take().unwrap().serial();
-            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                if let Some((windows, df, key)) = self.next_windows(true)? {
-                    let df = Self::evaluate_one(
-                        windows,
-                        key,
-                        &self.aggs,
-                        &state.in_memory_exec_state,
-                        df,
-                    )
-                    .await?;
-
-                    _ = send
-                        .send(Morsel::new_unregistered(
+            join_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                state.attribution.clone(),
+                async move {
+                    if let Some((windows, df, key)) = self.next_windows(true)? {
+                        let df = Self::evaluate_one(
+                            windows,
+                            key,
+                            &self.aggs,
+                            &state.in_memory_exec_state,
                             df,
-                            self.seq.successor().offset_by_u64(self.seq_offset.load()),
-                            SourceToken::new(),
-                        ))
-                        .await;
-                }
+                        )
+                        .await?;
 
-                self.buf_df = self.buf_df.clear();
-                self.buf_key_column = self.buf_key_column.clear();
-                self.buf_index_column = self.buf_index_column.clear();
+                        _ = send
+                            .send(Morsel::new_unregistered(
+                                df,
+                                self.seq.successor().offset_by_u64(self.seq_offset.load()),
+                                SourceToken::new(),
+                            ))
+                            .await;
+                    }
 
-                Ok(())
-            }));
+                    self.buf_df = self.buf_df.clear();
+                    self.buf_key_column = self.buf_key_column.clear();
+                    self.buf_index_column = self.buf_index_column.clear();
+
+                    Ok(())
+                },
+            ));
             return;
         };
 
@@ -286,8 +290,9 @@ impl ComputeNode for RollingGroupBy {
         join_handles.extend(rxs.into_iter().zip(send).map(|(mut rx, mut tx)| {
             let wg = WaitGroup::default();
             let aggs = self.aggs.clone();
+            let attribution = state.attribution.clone();
             let state = state.in_memory_exec_state.split();
-            scope.spawn_task(TaskPriority::High, async move {
+            scope.spawn_task(TaskPriority::High, attribution.clone(), async move {
                 while let Ok((mut morsel, (key, windows))) = rx.recv().await {
                     morsel = morsel
                         .async_try_map::<PolarsError, _, _>(async |df| {
@@ -309,7 +314,7 @@ impl ComputeNode for RollingGroupBy {
         // Distributor task.
         //
         // This finds boundaries to distribute to worker threads over.
-        join_handles.push(scope.spawn_task(TaskPriority::High, async move {
+        join_handles.push(scope.spawn_task(TaskPriority::High, state.attribution.clone(), async move {
             let mut prev_max = None;
             while let Ok(morsel) = recv.recv().await
                 && self.slice_length > 0

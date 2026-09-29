@@ -156,27 +156,31 @@ impl ComputeNode for SortedGroupBy {
             assert!(self.buf_df.height() > 0);
             assert!(self.slice.is_none_or(|(_, l)| l > 0));
             let mut send = send_ports[0].take().unwrap().serial();
-            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                let df = Self::evaluate_one(
-                    &self.key,
-                    &self.aggs,
-                    &state.in_memory_exec_state,
-                    &mut Vec::new(),
-                    std::mem::take(&mut self.buf_df),
-                    self.slice.unwrap_or((0, IdxSize::MAX)),
-                )
-                .await?;
+            join_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                state.attribution.clone(),
+                async move {
+                    let df = Self::evaluate_one(
+                        &self.key,
+                        &self.aggs,
+                        &state.in_memory_exec_state,
+                        &mut Vec::new(),
+                        std::mem::take(&mut self.buf_df),
+                        self.slice.unwrap_or((0, IdxSize::MAX)),
+                    )
+                    .await?;
 
-                _ = send
-                    .send(Morsel::new_unregistered(
-                        df,
-                        self.seq.successor().offset_by_u64(self.seq_offset.load()),
-                        SourceToken::new(),
-                    ))
-                    .await;
+                    _ = send
+                        .send(Morsel::new_unregistered(
+                            df,
+                            self.seq.successor().offset_by_u64(self.seq_offset.load()),
+                            SourceToken::new(),
+                        ))
+                        .await;
 
-                Ok(())
-            }));
+                    Ok(())
+                },
+            ));
             return;
         };
 
@@ -196,9 +200,10 @@ impl ComputeNode for SortedGroupBy {
             let wg = WaitGroup::default();
             let key = self.key.clone();
             let aggs = self.aggs.clone();
+            let attribution = state.attribution.clone();
             let state = state.in_memory_exec_state.split();
             let mut idxs = Vec::<IdxSize>::new();
-            scope.spawn_task(TaskPriority::High, async move {
+            scope.spawn_task(TaskPriority::High, attribution.clone(), async move {
                 while let Ok((mut morsel, windows_slice)) = rx.recv().await {
                     morsel = morsel
                         .async_try_map::<PolarsError, _, _>(async |df| {
@@ -221,81 +226,85 @@ impl ComputeNode for SortedGroupBy {
         // Distributor task.
         //
         // This finds boundaries to distribute to worker threads over.
-        join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-            while let Ok(morsel) = recv.recv().await
-                && self.slice.is_none_or(|(_, l)| l > 0)
-            {
-                let (sf, seq, source_token, wait_token) = morsel.into_inner();
-                let df = sf.into_df().await;
-                self.seq = seq;
-                drop(wait_token);
+        join_handles.push(scope.spawn_task(
+            TaskPriority::High,
+            state.attribution.clone(),
+            async move {
+                while let Ok(morsel) = recv.recv().await
+                    && self.slice.is_none_or(|(_, l)| l > 0)
+                {
+                    let (sf, seq, source_token, wait_token) = morsel.into_inner();
+                    let df = sf.into_df().await;
+                    self.seq = seq;
+                    drop(wait_token);
 
-                if df.height() == 0 {
-                    continue;
-                }
-
-                self.buf_df.vstack_mut_owned(df).unwrap();
-
-                let buf_key_column = self.buf_df.column(&self.key).unwrap();
-                let fst = buf_key_column.get(0).unwrap();
-                let lst = buf_key_column.get(buf_key_column.len() - 1).unwrap();
-
-                if fst == lst {
-                    continue;
-                }
-
-                let mut buf_key_column = buf_key_column.as_materialized_series().clone();
-                buf_key_column.set_sorted_flag(IsSorted::Ascending);
-
-                let descending = fst > lst;
-                let num_flushable = search_sorted(
-                    &buf_key_column,
-                    &buf_key_column.tail(Some(1)),
-                    SearchSortedSide::Left,
-                    descending,
-                )
-                .unwrap();
-                let num_flushable = unsafe { num_flushable.get_unchecked(0) }.unwrap();
-
-                let df;
-                (df, self.buf_df) = self.buf_df.split_at(num_flushable as i64);
-
-                let mut windows_offset = 0;
-                let mut windows_length = IdxSize::MAX;
-
-                if let Some((offset, length)) = self.slice.as_mut() {
-                    let buf_key_column = buf_key_column.head(Some(num_flushable as usize));
-
-                    // Since `buf_key_column` is flagged as sorted, this is simply a linear scan.
-                    let num_uniq_values = buf_key_column.n_unique()? as IdxSize;
-
-                    // Fast path: Slice allows skipping the entire morsel.
-                    if *offset >= num_uniq_values {
-                        *offset -= num_uniq_values;
+                    if df.height() == 0 {
                         continue;
                     }
 
-                    windows_offset = *offset;
-                    windows_length = *length;
+                    self.buf_df.vstack_mut_owned(df).unwrap();
 
-                    let num_skipped_values = (*offset).min(num_uniq_values);
-                    *offset -= num_skipped_values;
-                    *length = (*length).saturating_sub(num_uniq_values - num_skipped_values);
+                    let buf_key_column = self.buf_df.column(&self.key).unwrap();
+                    let fst = buf_key_column.get(0).unwrap();
+                    let lst = buf_key_column.get(buf_key_column.len() - 1).unwrap();
+
+                    if fst == lst {
+                        continue;
+                    }
+
+                    let mut buf_key_column = buf_key_column.as_materialized_series().clone();
+                    buf_key_column.set_sorted_flag(IsSorted::Ascending);
+
+                    let descending = fst > lst;
+                    let num_flushable = search_sorted(
+                        &buf_key_column,
+                        &buf_key_column.tail(Some(1)),
+                        SearchSortedSide::Left,
+                        descending,
+                    )
+                    .unwrap();
+                    let num_flushable = unsafe { num_flushable.get_unchecked(0) }.unwrap();
+
+                    let df;
+                    (df, self.buf_df) = self.buf_df.split_at(num_flushable as i64);
+
+                    let mut windows_offset = 0;
+                    let mut windows_length = IdxSize::MAX;
+
+                    if let Some((offset, length)) = self.slice.as_mut() {
+                        let buf_key_column = buf_key_column.head(Some(num_flushable as usize));
+
+                        // Since `buf_key_column` is flagged as sorted, this is simply a linear scan.
+                        let num_uniq_values = buf_key_column.n_unique()? as IdxSize;
+
+                        // Fast path: Slice allows skipping the entire morsel.
+                        if *offset >= num_uniq_values {
+                            *offset -= num_uniq_values;
+                            continue;
+                        }
+
+                        windows_offset = *offset;
+                        windows_length = *length;
+
+                        let num_skipped_values = (*offset).min(num_uniq_values);
+                        *offset -= num_skipped_values;
+                        *length = (*length).saturating_sub(num_uniq_values - num_skipped_values);
+                    }
+
+                    if distributor
+                        .send((
+                            Morsel::new_unregistered(df, seq, source_token),
+                            (windows_offset, windows_length),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
 
-                if distributor
-                    .send((
-                        Morsel::new_unregistered(df, seq, source_token),
-                        (windows_offset, windows_length),
-                    ))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-
-            Ok(())
-        }));
+                Ok(())
+            },
+        ));
     }
 }

@@ -52,6 +52,7 @@ impl ComputeNode for NegativeSliceNode {
         send: &mut [PortState],
         state: &StreamingExecutionState,
     ) -> PolarsResult<()> {
+        self.spill_ctx.set_attribution(state.attribution.clone());
         use NegativeSliceState::*;
 
         if send[0] == PortState::Done || self.length == 0 {
@@ -133,22 +134,26 @@ impl ComputeNode for NegativeSliceNode {
                 assert!(send_ports[0].is_none());
                 let max_buffer_needed = self.slice_offset.unsigned_abs() as usize;
                 let spill_ctx = self.spill_ctx.clone();
-                join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                    while let Ok(morsel) = recv.recv().await {
-                        buffer.total_len += morsel.height();
-                        let sf = morsel.into_sf();
-                        spill_ctx.register(&sf).await;
-                        buffer.frames.push_back(sf);
+                join_handles.push(scope.spawn_task(
+                    TaskPriority::High,
+                    state.attribution.clone(),
+                    async move {
+                        while let Ok(morsel) = recv.recv().await {
+                            buffer.total_len += morsel.height();
+                            let sf = morsel.into_sf();
+                            spill_ctx.register(&sf).await;
+                            buffer.frames.push_back(sf);
 
-                        if buffer.total_len - buffer.frames.front().unwrap().height()
-                            >= max_buffer_needed
-                        {
-                            buffer.total_len -= buffer.frames.pop_front().unwrap().height();
+                            if buffer.total_len - buffer.frames.front().unwrap().height()
+                                >= max_buffer_needed
+                            {
+                                buffer.total_len -= buffer.frames.pop_front().unwrap().height();
+                            }
                         }
-                    }
 
-                    Ok(())
-                }));
+                        Ok(())
+                    },
+                ));
             },
             NegativeSliceState::Source(in_memory_source_node) => {
                 assert!(recv_ports[0].is_none());

@@ -9,6 +9,7 @@ use crate::morsel::Morsel;
 use crate::nodes::io_sinks::components::partitioner::{PartitionedDataFrames, Partitioner};
 
 pub struct PartitionerPipeline {
+    pub attribution: polars_async::executor::TaskAttributionHandle,
     pub morsel_rx: connector::Receiver<Morsel>,
     pub partitioner: Arc<Partitioner>,
     pub inflight_morsel_semaphore: Arc<tokio::sync::Semaphore>,
@@ -20,6 +21,7 @@ pub struct PartitionerPipeline {
 impl PartitionerPipeline {
     pub async fn run(self) {
         let PartitionerPipeline {
+            attribution,
             mut morsel_rx,
             partitioner,
             inflight_morsel_semaphore,
@@ -43,6 +45,7 @@ impl PartitionerPipeline {
             if partitioned_dfs_tx
                 .send(executor::AbortOnDropHandle::new(executor::spawn(
                     TaskPriority::Low,
+                    attribution.clone(),
                     async move {
                         partitioner
                             .partition_morsel(morsel, in_memory_exec_state.as_ref())

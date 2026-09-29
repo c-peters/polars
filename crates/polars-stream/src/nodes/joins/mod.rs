@@ -168,10 +168,16 @@ struct BufferedStream {
 }
 
 impl BufferedStream {
-    pub fn new(name: PlSmallStr, morsels: Vec<Morsel>, start_offset: MorselSeq) -> Self {
+    pub fn new(
+        name: PlSmallStr,
+        attribution: polars_async::executor::TaskAttributionHandle,
+        morsels: Vec<Morsel>,
+        start_offset: MorselSeq,
+    ) -> Self {
         // Relabel so we can insert into parallel streams later.
         let mut seq = start_offset;
         let ctx = MostRecentSpillContext::new(name);
+        ctx.set_attribution(attribution);
         let queue = ArrayQueue::new(morsels.len().max(1));
         for morsel in morsels {
             let sf = SpillFrame::new_blocking(morsel.into_df_blocking(), &ctx);
@@ -194,6 +200,7 @@ impl BufferedStream {
     pub fn reinsert<'s, 'env>(
         &'s self,
         num_pipelines: usize,
+        attribution: polars_async::executor::TaskAttributionHandle,
         recv_port: Option<RecvPort<'_>>,
         scope: &'s TaskScope<'s, 'env>,
         join_handles: &mut Vec<JoinHandle<PolarsResult<()>>>,
@@ -210,39 +217,43 @@ impl BufferedStream {
             let (mut new_send, new_recv) = port_channel(None);
             out.push(new_recv);
             let source_token = source_token.clone();
-            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                // Act like an InMemorySource node until cached morsels are consumed.
-                let wait_group = WaitGroup::default();
-                loop {
-                    let Some((sf, seq)) = self.morsels.pop() else {
-                        break;
-                    };
-                    let mut morsel = Morsel::new(sf, seq, source_token.clone());
-                    morsel.set_consume_token(wait_group.token());
-                    if new_send.send(morsel).await.is_err() {
-                        return Ok(());
-                    }
-                    wait_group.wait().await;
-                    // TODO: Unfortunately we can't actually stop here without
-                    // re-buffering morsels from the stream that comes after.
-                    // if source_token.stop_requested() {
-                    //     break;
-                    // }
-                }
-
-                if let Some(mut recv) = orig_recv {
-                    while let Ok(mut morsel) = recv.recv().await {
-                        if source_token.stop_requested() {
-                            morsel.source_token().stop();
-                        }
-                        morsel.set_seq(morsel.seq().offset_by(self.post_buffer_offset));
-                        if new_send.send(morsel).await.is_err() {
+            join_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                attribution.clone(),
+                async move {
+                    // Act like an InMemorySource node until cached morsels are consumed.
+                    let wait_group = WaitGroup::default();
+                    loop {
+                        let Some((sf, seq)) = self.morsels.pop() else {
                             break;
+                        };
+                        let mut morsel = Morsel::new(sf, seq, source_token.clone());
+                        morsel.set_consume_token(wait_group.token());
+                        if new_send.send(morsel).await.is_err() {
+                            return Ok(());
+                        }
+                        wait_group.wait().await;
+                        // TODO: Unfortunately we can't actually stop here without
+                        // re-buffering morsels from the stream that comes after.
+                        // if source_token.stop_requested() {
+                        //     break;
+                        // }
+                    }
+
+                    if let Some(mut recv) = orig_recv {
+                        while let Ok(mut morsel) = recv.recv().await {
+                            if source_token.stop_requested() {
+                                morsel.source_token().stop();
+                            }
+                            morsel.set_seq(morsel.seq().offset_by(self.post_buffer_offset));
+                            if new_send.send(morsel).await.is_err() {
+                                break;
+                            }
                         }
                     }
-                }
-                Ok(())
-            }));
+                    Ok(())
+                },
+            ));
         }
         Some(out)
     }

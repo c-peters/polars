@@ -58,30 +58,34 @@ impl ComputeNode for SimpleProjectionNode {
 
         for (mut recv, mut send) in receivers.into_iter().zip(senders) {
             let slf = &*self;
-            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                while let Ok(morsel) = recv.recv().await {
-                    let morsel = morsel
-                        .try_map(|df| unsafe {
-                            let mut cols = Vec::with_capacity(slf.projection.len());
-                            for (idx, name, rename) in &slf.projection {
-                                let mut col = df.columns()[*idx].clone();
-                                debug_assert_eq!(col.name(), name);
-                                if let Some(name) = rename {
-                                    col.rename(name.clone())
+            join_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                _state.attribution.clone(),
+                async move {
+                    while let Ok(morsel) = recv.recv().await {
+                        let morsel = morsel
+                            .try_map(|df| unsafe {
+                                let mut cols = Vec::with_capacity(slf.projection.len());
+                                for (idx, name, rename) in &slf.projection {
+                                    let mut col = df.columns()[*idx].clone();
+                                    debug_assert_eq!(col.name(), name);
+                                    if let Some(name) = rename {
+                                        col.rename(name.clone())
+                                    }
+                                    cols.push(col)
                                 }
-                                cols.push(col)
-                            }
-                            PolarsResult::Ok(DataFrame::new_unchecked(df.height(), cols))
-                        })
-                        .await?;
+                                PolarsResult::Ok(DataFrame::new_unchecked(df.height(), cols))
+                            })
+                            .await?;
 
-                    if send.send(morsel).await.is_err() {
-                        break;
+                        if send.send(morsel).await.is_err() {
+                            break;
+                        }
                     }
-                }
 
-                Ok(())
-            }));
+                    Ok(())
+                },
+            ));
         }
     }
 }

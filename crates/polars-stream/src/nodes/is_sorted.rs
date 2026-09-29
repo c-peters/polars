@@ -59,31 +59,35 @@ impl IsSortedNode {
         join_handles: &mut Vec<JoinHandle<PolarsResult<()>>>,
     ) {
         let mut recv = recv.serial();
-        join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-            while let Ok(morsel) = recv.recv().await {
-                if !*is_sorted {
-                    return Ok(());
-                }
+        join_handles.push(scope.spawn_task(
+            TaskPriority::High,
+            _state.attribution.clone(),
+            async move {
+                while let Ok(morsel) = recv.recv().await {
+                    if !*is_sorted {
+                        return Ok(());
+                    }
 
-                let df = morsel.into_df().await;
-                if df.height() == 0 {
-                    continue;
-                }
-                assert_eq!(df.width(), 1);
-                let series = df[0].as_materialized_series();
+                    let df = morsel.into_df().await;
+                    if df.height() == 0 {
+                        continue;
+                    }
+                    assert_eq!(df.width(), 1);
+                    let series = df[0].as_materialized_series();
 
-                if !process_morsel(
-                    series,
-                    committed_descending,
-                    committed_nulls_last,
-                    last_value,
-                )? {
-                    *is_sorted = false;
-                    return Ok(());
+                    if !process_morsel(
+                        series,
+                        committed_descending,
+                        committed_nulls_last,
+                        last_value,
+                    )? {
+                        *is_sorted = false;
+                        return Ok(());
+                    }
                 }
-            }
-            Ok(())
-        }))
+                Ok(())
+            },
+        ))
     }
 }
 

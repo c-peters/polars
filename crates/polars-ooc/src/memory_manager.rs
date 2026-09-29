@@ -139,7 +139,9 @@ impl MemoryManager {
                 let successful_spill = successful_spill.clone();
                 let ctx = ctx.clone();
 
-                polars_async::executor::spawn(TaskPriority::High, async move {
+                // Credit the selected spill context, which may belong to another query.
+                let attribution = ctx.upgrade().map(|c| c.attribution()).unwrap_or_default();
+                polars_async::executor::spawn(TaskPriority::High, attribution, async move {
                     // Spill, or reinsert if a failure.
                     match spillable.clone().try_spill(ctx.clone()) {
                         Ok(spill_success) => {

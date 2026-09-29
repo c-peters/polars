@@ -21,6 +21,7 @@ use crate::pipe::PhysicalPipe;
 
 #[derive(Clone)]
 pub struct StreamingExecutionState {
+    pub attribution: executor::TaskAttributionHandle,
     /// The number of parallel pipelines we have within each stream.
     pub num_pipelines: usize,
 
@@ -223,6 +224,16 @@ fn run_subgraph(
         }
     }
 
+    // Keep node states alive for every borrowed future in the task scope.
+    let node_states: SecondaryMap<GraphNodeKey, StreamingExecutionState> = nodes
+        .iter()
+        .map(|&key| {
+            let mut node_state = state.clone();
+            node_state.attribution = attribute_tasks_to_node(key, metrics.as_ref());
+            (key, node_state)
+        })
+        .collect();
+
     executor::task_scope(|scope| {
         // Using SlotMap::iter_mut we can get simultaneous mutable references. By storing them and
         // removing the references from the secondary map as we do our topological sort we ensure
@@ -258,7 +269,7 @@ fn run_subgraph(
 
             // Spawn the tasks.
             {
-                let _attribution = attribute_tasks_to_node(node_key, metrics.as_ref());
+                let state = &node_states[node_key];
                 node.compute.spawn(
                     scope,
                     &mut recv_ports[..],
@@ -310,9 +321,9 @@ fn run_subgraph(
         // Spawn tasks for all the physical pipes (no-op on most, but needed for
         // those with distributors or linearizers), attributing work to the receiver.
         for (pipe_key, pipe) in physical_pipes.iter_mut() {
-            let _attribution =
+            let attribution =
                 attribute_tasks_to_node(graph.pipes[pipe_key].receiver, metrics.as_ref());
-            pipe.spawn(scope, &mut join_handles);
+            pipe.spawn(scope, attribution, &mut join_handles);
         }
 
         // Record setup separately from the wait for phase completion.
@@ -350,6 +361,7 @@ pub fn execute_graph(
     let (subphase_tasks_send, subphase_tasks_recv) = crossbeam_channel::unbounded();
 
     let state = StreamingExecutionState {
+        attribution: Default::default(),
         num_pipelines: polars_config::config().max_threads(),
         in_memory_exec_state: ExecutionState::default(),
         query_tasks_send,

@@ -18,6 +18,7 @@ use crate::nodes::io_sinks::components::partitioner::{self, PartitionedDataFrame
 use crate::nodes::io_sinks::components::size::RowCountAndSize;
 
 pub struct PartitionDistributor {
+    pub attribution: polars_async::executor::TaskAttributionHandle,
     pub node_name: PlSmallStr,
     pub partitioned_dfs_rx: tokio::sync::mpsc::Receiver<
         executor::AbortOnDropHandle<PolarsResult<PartitionedDataFrames>>,
@@ -35,6 +36,7 @@ pub struct PartitionDistributor {
 impl PartitionDistributor {
     pub async fn run(self) -> PolarsResult<()> {
         let PartitionDistributor {
+            attribution,
             node_name,
             mut partitioned_dfs_rx,
             partition_morsel_sender,
@@ -279,6 +281,7 @@ impl PartitionDistributor {
             if let Some(file_sink_task_data) = partition.file_sink_task_data.take() {
                 executor::spawn(
                     TaskPriority::Low,
+                    attribution.clone(),
                     error_capture
                         .clone()
                         .wrap_future(file_sink_task_data.close()),

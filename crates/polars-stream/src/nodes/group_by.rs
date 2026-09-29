@@ -245,121 +245,126 @@ impl GroupBySinkState {
             let random_state = &self.random_state;
             let partitioner = self.partitioner.clone();
             let has_order_sensitive_agg = self.has_order_sensitive_agg;
-            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                let mut hot_idxs = Vec::new();
-                let mut hot_group_idxs = Vec::new();
-                let mut cold_idxs = Vec::new();
-                let mut identity_idxs: Vec<IdxSize> = Vec::new();
-                while let Some((input_idx, morsel)) = recv.recv().await {
-                    // Compute hot group indices from key.
-                    let seq = morsel.seq().to_u64();
-                    let mut df = morsel.into_df().await;
-                    let mut key_columns = Vec::new();
-                    for selector in &key_selectors_per_input[input_idx] {
-                        let s = selector.evaluate(&df, &state.in_memory_exec_state).await?;
-                        key_columns.push(s.into_column());
-                    }
-                    let keys = unsafe {
-                        DataFrame::new_unchecked_with_broadcast(df.height(), key_columns)?
-                    };
-                    let hash_keys = HashKeys::from_df(&keys, random_state.clone(), true, false);
+            join_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                state.attribution.clone(),
+                async move {
+                    let mut hot_idxs = Vec::new();
+                    let mut hot_group_idxs = Vec::new();
+                    let mut cold_idxs = Vec::new();
+                    let mut identity_idxs: Vec<IdxSize> = Vec::new();
+                    while let Some((input_idx, morsel)) = recv.recv().await {
+                        // Compute hot group indices from key.
+                        let seq = morsel.seq().to_u64();
+                        let mut df = morsel.into_df().await;
+                        let mut key_columns = Vec::new();
+                        for selector in &key_selectors_per_input[input_idx] {
+                            let s = selector.evaluate(&df, &state.in_memory_exec_state).await?;
+                            key_columns.push(s.into_column());
+                        }
+                        let keys = unsafe {
+                            DataFrame::new_unchecked_with_broadcast(df.height(), key_columns)?
+                        };
+                        let hash_keys = HashKeys::from_df(&keys, random_state.clone(), true, false);
 
-                    let hot_grouper = &mut local.hot_grouper_per_input[input_idx];
-                    hot_idxs.clear();
-                    hot_group_idxs.clear();
-                    cold_idxs.clear();
-                    hot_grouper.insert_keys(
-                        &hash_keys,
-                        &mut hot_idxs,
-                        &mut hot_group_idxs,
-                        &mut cold_idxs,
-                        has_order_sensitive_agg,
-                    );
+                        let hot_grouper = &mut local.hot_grouper_per_input[input_idx];
+                        hot_idxs.clear();
+                        hot_group_idxs.clear();
+                        cold_idxs.clear();
+                        hot_grouper.insert_keys(
+                            &hash_keys,
+                            &mut hot_idxs,
+                            &mut hot_group_idxs,
+                            &mut cold_idxs,
+                            has_order_sensitive_agg,
+                        );
 
-                    // Drop columns which are neither reduction inputs nor fused sources.
-                    let payload = &payload_per_input[input_idx];
-                    if payload.stored_cols.len() < df.width() {
-                        df = unsafe { df.select_unchecked(&payload.stored_cols) }.unwrap();
-                    }
-                    df.rechunk_mut(); // For gathers.
+                        // Drop columns which are neither reduction inputs nor fused sources.
+                        let payload = &payload_per_input[input_idx];
+                        if payload.stored_cols.len() < df.width() {
+                            df = unsafe { df.select_unchecked(&payload.stored_cols) }.unwrap();
+                        }
+                        df.rechunk_mut(); // For gathers.
 
-                    // Update hot reductions.
-                    for red_idx in &reductions_per_input[input_idx] {
-                        local.hot_grouped_reductions[*red_idx].resize(hot_grouper.num_groups());
-                    }
-                    payload
-                        .update_reductions(
-                            &df,
-                            &hot_idxs,
-                            &mut identity_idxs,
-                            grouped_reduction_cols,
-                            &mut local.hot_grouped_reductions,
-                            &state.in_memory_exec_state,
-                            |reduction, in_cols, subset| unsafe {
-                                reduction.update_groups_while_evicting(
-                                    in_cols,
-                                    subset,
-                                    &hot_group_idxs,
-                                    seq,
-                                )
-                            },
-                        )
-                        .await?;
+                        // Update hot reductions.
+                        for red_idx in &reductions_per_input[input_idx] {
+                            local.hot_grouped_reductions[*red_idx].resize(hot_grouper.num_groups());
+                        }
+                        payload
+                            .update_reductions(
+                                &df,
+                                &hot_idxs,
+                                &mut identity_idxs,
+                                grouped_reduction_cols,
+                                &mut local.hot_grouped_reductions,
+                                &state.in_memory_exec_state,
+                                |reduction, in_cols, subset| unsafe {
+                                    reduction.update_groups_while_evicting(
+                                        in_cols,
+                                        subset,
+                                        &hot_group_idxs,
+                                        seq,
+                                    )
+                                },
+                            )
+                            .await?;
 
-                    // Store cold keys.
-                    if !cold_idxs.is_empty() {
-                        let mut cold_keys = hash_keys;
-                        let mut cold_df = df;
+                        // Store cold keys.
+                        if !cold_idxs.is_empty() {
+                            let mut cold_keys = hash_keys;
+                            let mut cold_df = df;
 
-                        // 75% or more cold, don't gather.
-                        if cold_idxs.len() as u64 >= cold_df.height() as u64 * 3 / 4 {
-                            unsafe {
-                                cold_keys.gen_idxs_per_partition_subset(
-                                    &cold_idxs,
+                            // 75% or more cold, don't gather.
+                            if cold_idxs.len() as u64 >= cold_df.height() as u64 * 3 / 4 {
+                                unsafe {
+                                    cold_keys.gen_idxs_per_partition_subset(
+                                        &cold_idxs,
+                                        &partitioner,
+                                        &mut local.morsel_idxs_values_per_p,
+                                        &mut local.sketch_per_p,
+                                        true,
+                                    );
+                                }
+                            } else {
+                                unsafe {
+                                    cold_keys = cold_keys.gather_unchecked(&cold_idxs);
+                                    cold_df = cold_df.take_slice_unchecked_impl(&cold_idxs, false);
+                                }
+
+                                cold_keys.gen_idxs_per_partition(
                                     &partitioner,
                                     &mut local.morsel_idxs_values_per_p,
                                     &mut local.sketch_per_p,
                                     true,
                                 );
                             }
-                        } else {
-                            unsafe {
-                                cold_keys = cold_keys.gather_unchecked(&cold_idxs);
-                                cold_df = cold_df.take_slice_unchecked_impl(&cold_idxs, false);
-                            }
 
-                            cold_keys.gen_idxs_per_partition(
-                                &partitioner,
-                                &mut local.morsel_idxs_values_per_p,
-                                &mut local.sketch_per_p,
-                                true,
-                            );
+                            local
+                                .morsel_idxs_offsets_per_p
+                                .extend(local.morsel_idxs_values_per_p.iter().map(|vp| vp.len()));
+                            let sf = SpillFrame::new(cold_df, spill_ctx).await;
+                            local.cold_morsels.push((input_idx, seq, cold_keys, sf));
                         }
 
-                        local
-                            .morsel_idxs_offsets_per_p
-                            .extend(local.morsel_idxs_values_per_p.iter().map(|vp| vp.len()));
-                        let sf = SpillFrame::new(cold_df, spill_ctx).await;
-                        local.cold_morsels.push((input_idx, seq, cold_keys, sf));
+                        // If we have too many evicted rows, flush them.
+                        if hot_grouper.num_evictions() >= get_ideal_morsel_size() {
+                            local.flush_evictions(
+                                input_idx,
+                                &reductions_per_input[input_idx],
+                                &partitioner,
+                            );
+                        }
                     }
-
-                    // If we have too many evicted rows, flush them.
-                    if hot_grouper.num_evictions() >= get_ideal_morsel_size() {
-                        local.flush_evictions(
-                            input_idx,
-                            &reductions_per_input[input_idx],
-                            &partitioner,
-                        );
-                    }
-                }
-                Ok(())
-            }));
+                    Ok(())
+                },
+            ));
         }
     }
 
     fn combine_locals(
         &mut self,
         exec_state: &ExecutionState,
+        attribution: polars_async::executor::TaskAttributionHandle,
     ) -> PolarsResult<Vec<GroupByPartition>> {
         // Finalize pre-aggregations.
         RAYON.install(|| {
@@ -433,169 +438,173 @@ impl GroupBySinkState {
                 let drop_q_send = drop_q_send.clone();
                 let drop_q_recv = drop_q_recv.clone();
                 let output_per_partition = &output_per_partition;
-                join_handles.push(s.spawn_task(TaskPriority::High, async move {
-                    // Extract from outer arc and drop outer arc.
-                    let morsels_per_local = Arc::unwrap_or_clone(arc_morsels_per_local);
-                    let pre_aggs_per_local = Arc::unwrap_or_clone(arc_pre_aggs_per_local);
+                join_handles.push(s.spawn_task(
+                    TaskPriority::High,
+                    attribution.clone(),
+                    async move {
+                        // Extract from outer arc and drop outer arc.
+                        let morsels_per_local = Arc::unwrap_or_clone(arc_morsels_per_local);
+                        let pre_aggs_per_local = Arc::unwrap_or_clone(arc_pre_aggs_per_local);
 
-                    // Compute cardinality estimate and total amount of
-                    // payload for this partition.
-                    let mut sketch = CardinalitySketch::new();
-                    for l in locals {
-                        sketch.combine(&l.sketch_per_p[p]);
-                    }
-
-                    let sketch_estimate = sketch.estimate();
-                    estimated_groups_metric.add(sketch_estimate as i64);
-
-                    // Allocate grouper and reductions.
-                    let est_num_groups = sketch_estimate * 5 / 4;
-                    let mut p_grouper = grouper_template.new_empty();
-                    let mut p_reductions = grouped_reductions_template
-                        .iter()
-                        .map(|gr| gr.new_empty())
-                        .collect_vec();
-                    p_grouper.reserve(est_num_groups);
-                    for r in &mut p_reductions {
-                        r.reserve(est_num_groups);
-                    }
-
-                    // Insert morsels.
-                    let mut skip_drop_attempt = false;
-                    let mut group_idxs = Vec::new();
-                    let mut identity_idxs: Vec<IdxSize> = Vec::new();
-                    for (l, l_morsels) in locals.iter().zip(morsels_per_local) {
-                        // Try to help with dropping.
-                        if !skip_drop_attempt {
-                            drop(drop_q_recv.try_recv());
+                        // Compute cardinality estimate and total amount of
+                        // payload for this partition.
+                        let mut sketch = CardinalitySketch::new();
+                        for l in locals {
+                            sketch.combine(&l.sketch_per_p[p]);
                         }
 
-                        for (i, morsel) in l_morsels.iter().enumerate() {
-                            let (input_idx, seq_id, keys, sf) = morsel;
-                            let morsel_df = sf.get().await;
-                            unsafe {
-                                let p_morsel_idxs_start =
-                                    l.morsel_idxs_offsets_per_p[i * num_partitions + p];
-                                let p_morsel_idxs_stop =
-                                    l.morsel_idxs_offsets_per_p[(i + 1) * num_partitions + p];
-                                let p_morsel_idxs = &l.morsel_idxs_values_per_p[p]
-                                    [p_morsel_idxs_start..p_morsel_idxs_stop];
+                        let sketch_estimate = sketch.estimate();
+                        estimated_groups_metric.add(sketch_estimate as i64);
 
-                                group_idxs.clear();
-                                p_grouper.insert_keys_subset(
-                                    keys,
-                                    p_morsel_idxs,
-                                    Some(&mut group_idxs),
-                                );
+                        // Allocate grouper and reductions.
+                        let est_num_groups = sketch_estimate * 5 / 4;
+                        let mut p_grouper = grouper_template.new_empty();
+                        let mut p_reductions = grouped_reductions_template
+                            .iter()
+                            .map(|gr| gr.new_empty())
+                            .collect_vec();
+                        p_grouper.reserve(est_num_groups);
+                        for r in &mut p_reductions {
+                            r.reserve(est_num_groups);
+                        }
 
-                                for red_idx in &reductions_per_input[*input_idx] {
-                                    p_reductions[*red_idx].resize(p_grouper.num_groups());
-                                }
+                        // Insert morsels.
+                        let mut skip_drop_attempt = false;
+                        let mut group_idxs = Vec::new();
+                        let mut identity_idxs: Vec<IdxSize> = Vec::new();
+                        for (l, l_morsels) in locals.iter().zip(morsels_per_local) {
+                            // Try to help with dropping.
+                            if !skip_drop_attempt {
+                                drop(drop_q_recv.try_recv());
+                            }
 
-                                payload_per_input[*input_idx]
-                                    .update_reductions(
-                                        &morsel_df,
+                            for (i, morsel) in l_morsels.iter().enumerate() {
+                                let (input_idx, seq_id, keys, sf) = morsel;
+                                let morsel_df = sf.get().await;
+                                unsafe {
+                                    let p_morsel_idxs_start =
+                                        l.morsel_idxs_offsets_per_p[i * num_partitions + p];
+                                    let p_morsel_idxs_stop =
+                                        l.morsel_idxs_offsets_per_p[(i + 1) * num_partitions + p];
+                                    let p_morsel_idxs = &l.morsel_idxs_values_per_p[p]
+                                        [p_morsel_idxs_start..p_morsel_idxs_stop];
+
+                                    group_idxs.clear();
+                                    p_grouper.insert_keys_subset(
+                                        keys,
                                         p_morsel_idxs,
-                                        &mut identity_idxs,
-                                        grouped_reduction_cols,
-                                        &mut p_reductions,
-                                        exec_state,
-                                        |reduction, in_cols, subset| {
-                                            reduction.update_groups_subset(
-                                                in_cols,
-                                                subset,
-                                                &group_idxs,
-                                                *seq_id,
-                                            )
-                                        },
-                                    )
-                                    .await?;
-                            }
-                        }
+                                        Some(&mut group_idxs),
+                                    );
 
-                        if let Some(l) = Arc::into_inner(l_morsels) {
-                            // If we're the last thread to process this set of morsels we're probably
-                            // falling behind the rest, since the drop can be quite expensive we skip
-                            // a drop attempt hoping someone else will pick up the slack.
-                            drop(drop_q_send.try_send(ToDrop::A(l)));
-                            skip_drop_attempt = true;
-                        } else {
-                            skip_drop_attempt = false;
-                        }
-                    }
+                                    for red_idx in &reductions_per_input[*input_idx] {
+                                        p_reductions[*red_idx].resize(p_grouper.num_groups());
+                                    }
 
-                    // Insert pre-aggregates.
-                    for (l, l_pre_aggs) in locals.iter().zip(pre_aggs_per_local) {
-                        // Try to help with dropping.
-                        if !skip_drop_attempt {
-                            drop(drop_q_recv.try_recv());
-                        }
-
-                        for (i, key_pre_aggs) in l_pre_aggs.iter().enumerate() {
-                            let PreAgg {
-                                keys,
-                                reduction_idxs: r_idxs,
-                                reductions: pre_aggs,
-                            } = key_pre_aggs;
-                            unsafe {
-                                let p_pre_agg_idxs_start =
-                                    l.pre_agg_idxs_offsets_per_p[i * num_partitions + p];
-                                let p_pre_agg_idxs_stop =
-                                    l.pre_agg_idxs_offsets_per_p[(i + 1) * num_partitions + p];
-                                let p_pre_agg_idxs = &l.pre_agg_idxs_values_per_p[p]
-                                    [p_pre_agg_idxs_start..p_pre_agg_idxs_stop];
-
-                                group_idxs.clear();
-                                p_grouper.insert_keys_subset(
-                                    keys,
-                                    p_pre_agg_idxs,
-                                    Some(&mut group_idxs),
-                                );
-                                for (pre_agg, r_idx) in pre_aggs.iter().zip(r_idxs.iter()) {
-                                    let r = &mut p_reductions[*r_idx];
-                                    r.resize(p_grouper.num_groups());
-                                    r.combine_subset(&**pre_agg, p_pre_agg_idxs, &group_idxs)?;
+                                    payload_per_input[*input_idx]
+                                        .update_reductions(
+                                            &morsel_df,
+                                            p_morsel_idxs,
+                                            &mut identity_idxs,
+                                            grouped_reduction_cols,
+                                            &mut p_reductions,
+                                            exec_state,
+                                            |reduction, in_cols, subset| {
+                                                reduction.update_groups_subset(
+                                                    in_cols,
+                                                    subset,
+                                                    &group_idxs,
+                                                    *seq_id,
+                                                )
+                                            },
+                                        )
+                                        .await?;
                                 }
                             }
+
+                            if let Some(l) = Arc::into_inner(l_morsels) {
+                                // If we're the last thread to process this set of morsels we're probably
+                                // falling behind the rest, since the drop can be quite expensive we skip
+                                // a drop attempt hoping someone else will pick up the slack.
+                                drop(drop_q_send.try_send(ToDrop::A(l)));
+                                skip_drop_attempt = true;
+                            } else {
+                                skip_drop_attempt = false;
+                            }
                         }
 
-                        if let Some(l) = Arc::into_inner(l_pre_aggs) {
-                            // If we're the last thread to process this set of morsels we're probably
-                            // falling behind the rest, since the drop can be quite expensive we skip
-                            // a drop attempt hoping someone else will pick up the slack.
-                            drop(drop_q_send.try_send(ToDrop::B(l)));
-                            skip_drop_attempt = true;
-                        } else {
-                            skip_drop_attempt = false;
+                        // Insert pre-aggregates.
+                        for (l, l_pre_aggs) in locals.iter().zip(pre_aggs_per_local) {
+                            // Try to help with dropping.
+                            if !skip_drop_attempt {
+                                drop(drop_q_recv.try_recv());
+                            }
+
+                            for (i, key_pre_aggs) in l_pre_aggs.iter().enumerate() {
+                                let PreAgg {
+                                    keys,
+                                    reduction_idxs: r_idxs,
+                                    reductions: pre_aggs,
+                                } = key_pre_aggs;
+                                unsafe {
+                                    let p_pre_agg_idxs_start =
+                                        l.pre_agg_idxs_offsets_per_p[i * num_partitions + p];
+                                    let p_pre_agg_idxs_stop =
+                                        l.pre_agg_idxs_offsets_per_p[(i + 1) * num_partitions + p];
+                                    let p_pre_agg_idxs = &l.pre_agg_idxs_values_per_p[p]
+                                        [p_pre_agg_idxs_start..p_pre_agg_idxs_stop];
+
+                                    group_idxs.clear();
+                                    p_grouper.insert_keys_subset(
+                                        keys,
+                                        p_pre_agg_idxs,
+                                        Some(&mut group_idxs),
+                                    );
+                                    for (pre_agg, r_idx) in pre_aggs.iter().zip(r_idxs.iter()) {
+                                        let r = &mut p_reductions[*r_idx];
+                                        r.resize(p_grouper.num_groups());
+                                        r.combine_subset(&**pre_agg, p_pre_agg_idxs, &group_idxs)?;
+                                    }
+                                }
+                            }
+
+                            if let Some(l) = Arc::into_inner(l_pre_aggs) {
+                                // If we're the last thread to process this set of morsels we're probably
+                                // falling behind the rest, since the drop can be quite expensive we skip
+                                // a drop attempt hoping someone else will pick up the slack.
+                                drop(drop_q_send.try_send(ToDrop::B(l)));
+                                skip_drop_attempt = true;
+                            } else {
+                                skip_drop_attempt = false;
+                            }
                         }
-                    }
 
-                    // Each input only resizes its own reductions, so ensure all have the right length.
-                    for r in &mut p_reductions {
-                        r.resize(p_grouper.num_groups());
-                    }
+                        // Each input only resizes its own reductions, so ensure all have the right length.
+                        for r in &mut p_reductions {
+                            r.resize(p_grouper.num_groups());
+                        }
 
-                    actual_groups_metric.add(p_grouper.num_groups() as i64);
+                        actual_groups_metric.add(p_grouper.num_groups() as i64);
 
-                    // We're done, help others out by doing drops.
-                    drop(drop_q_send); // So we don't deadlock trying to receive from ourselves.
-                    while let Ok(to_drop) = drop_q_recv.recv().await {
-                        drop(to_drop);
-                    }
+                        // We're done, help others out by doing drops.
+                        drop(drop_q_send); // So we don't deadlock trying to receive from ourselves.
+                        while let Ok(to_drop) = drop_q_recv.recv().await {
+                            drop(to_drop);
+                        }
 
-                    output_per_partition
-                        .try_set(
-                            p,
-                            GroupByPartition {
-                                grouper: p_grouper,
-                                grouped_reductions: p_reductions,
-                            },
-                        )
-                        .ok()
-                        .unwrap();
+                        output_per_partition
+                            .try_set(
+                                p,
+                                GroupByPartition {
+                                    grouper: p_grouper,
+                                    grouped_reductions: p_reductions,
+                                },
+                            )
+                            .ok()
+                            .unwrap();
 
-                    PolarsResult::Ok(())
-                }));
+                        PolarsResult::Ok(())
+                    },
+                ));
             }
 
             // Drop outer arc after spawning each thread so the inner arcs
@@ -734,6 +743,7 @@ impl ComputeNode for GroupByNode {
         send: &mut [PortState],
         state: &StreamingExecutionState,
     ) -> PolarsResult<()> {
+        self.spill_ctx.set_attribution(state.attribution.clone());
         assert!(recv.len() == self.num_inputs && send.len() == 1);
 
         // State transitions.
@@ -749,7 +759,8 @@ impl ComputeNode for GroupByNode {
                 else {
                     unreachable!()
                 };
-                let partitions = sink.combine_locals(&state.in_memory_exec_state)?;
+                let partitions =
+                    sink.combine_locals(&state.in_memory_exec_state, state.attribution.clone())?;
                 let dfs = RAYON.install(|| {
                     partitions
                         .into_par_iter()
@@ -815,15 +826,19 @@ impl ComputeNode for GroupByNode {
                             .into_iter()
                             .zip(senders.iter().cloned())
                         {
-                            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                                while let Ok(morsel) = r.recv().await {
-                                    if s.send((i, morsel)).await.is_err() {
-                                        break;
+                            join_handles.push(scope.spawn_task(
+                                TaskPriority::High,
+                                state.attribution.clone(),
+                                async move {
+                                    while let Ok(morsel) = r.recv().await {
+                                        if s.send((i, morsel)).await.is_err() {
+                                            break;
+                                        }
                                     }
-                                }
 
-                                Ok(())
-                            }));
+                                    Ok(())
+                                },
+                            ));
                         }
                     }
                 }

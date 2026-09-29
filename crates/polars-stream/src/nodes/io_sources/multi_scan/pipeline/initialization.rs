@@ -59,19 +59,24 @@ pub fn initialize_multi_scan_pipeline(
 
     let bridge_state = Arc::new(Mutex::new(BridgeState::NotYetStarted));
 
-    let (bridge_handle, bridge_recv_port_tx, phase_channel_tx) = spawn_bridge(bridge_state.clone());
+    let (bridge_handle, bridge_recv_port_tx, phase_channel_tx) =
+        spawn_bridge(execution_state.attribution.clone(), bridge_state.clone());
 
-    let task_handle = AbortOnDropHandle::new(executor::spawn(TaskPriority::Low, async move {
-        finish_initialize_multi_scan_pipeline(
-            config,
-            bridge_recv_port_tx,
-            execution_state,
-            io_metrics,
-        )
-        .await?;
-        bridge_handle.await;
-        Ok(())
-    }));
+    let task_handle = AbortOnDropHandle::new(executor::spawn(
+        TaskPriority::Low,
+        execution_state.attribution.clone(),
+        async move {
+            finish_initialize_multi_scan_pipeline(
+                config,
+                bridge_recv_port_tx,
+                execution_state,
+                io_metrics,
+            )
+            .await?;
+            bridge_handle.await;
+            Ok(())
+        },
+    ));
 
     InitializedPipelineState {
         task_handle,
@@ -340,8 +345,10 @@ async fn finish_initialize_multi_scan_pipeline(
             io_metrics,
         )?;
 
+        let attribution = execution_state.attribution.clone();
         futures::stream::iter(range)
             .map(move |scan_source_idx| {
+                let attribution = attribution.clone();
                 let sources = sources.clone();
                 let cloud_options = cloud_options.clone();
                 let file_reader_builder = file_reader_builder.clone();
@@ -351,54 +358,63 @@ async fn finish_initialize_multi_scan_pipeline(
                 let maybe_initialized = initialized_readers.pop_front();
                 let scan_source = sources.get(scan_source_idx).unwrap().into_owned();
 
-                AbortOnDropHandle::new(executor::spawn(TaskPriority::Low, async move {
-                    let (scan_source, reader, n_rows_in_file) = async {
-                        if verbose {
-                            eprintln!("[MultiScan]: Initialize source {scan_source_idx}");
-                        }
+                AbortOnDropHandle::new(executor::spawn(
+                    TaskPriority::Low,
+                    attribution.clone(),
+                    async move {
+                        let (scan_source, reader, n_rows_in_file) = async {
+                            if verbose {
+                                eprintln!("[MultiScan]: Initialize source {scan_source_idx}");
+                            }
 
-                        let scan_source = scan_source?;
+                            let scan_source = scan_source?;
 
-                        if let Some((reader, n_rows_in_file)) = maybe_initialized {
-                            return PolarsResult::Ok((scan_source, reader, Some(n_rows_in_file)));
-                        }
+                            if let Some((reader, n_rows_in_file)) = maybe_initialized {
+                                return PolarsResult::Ok((
+                                    scan_source,
+                                    reader,
+                                    Some(n_rows_in_file),
+                                ));
+                            }
 
-                        let mut reader = file_reader_builder.build_file_reader(
-                            scan_source.clone(),
-                            cloud_options.clone(),
-                            scan_source_idx,
-                        );
-
-                        reader.initialize().await?;
-                        let opt_n_rows = reader
-                            .fast_n_rows_in_file()
-                            .await?
-                            .map(|num_phys_rows| RowCounter::new(num_phys_rows, 0));
-
-                        PolarsResult::Ok((scan_source, reader, opt_n_rows))
-                    }
-                    .await?;
-
-                    let row_deletions: Option<RowDeletionsInit> = initialized_row_deletions
-                        .get(&scan_source_idx)
-                        .map(|x| RowDeletionsInit::Initialized(x.clone()))
-                        .or_else(|| {
-                            deletion_files_provider.spawn_row_deletions_init(
+                            let mut reader = file_reader_builder.build_file_reader(
+                                scan_source.clone(),
+                                cloud_options.clone(),
                                 scan_source_idx,
-                                cloud_options,
-                                num_pipelines,
-                                verbose,
-                            )
-                        });
+                            );
 
-                    Ok(InitializedReaderState {
-                        scan_source_idx,
-                        scan_source,
-                        reader,
-                        n_rows_in_file,
-                        row_deletions,
-                    })
-                }))
+                            reader.initialize().await?;
+                            let opt_n_rows = reader
+                                .fast_n_rows_in_file()
+                                .await?
+                                .map(|num_phys_rows| RowCounter::new(num_phys_rows, 0));
+
+                            PolarsResult::Ok((scan_source, reader, opt_n_rows))
+                        }
+                        .await?;
+
+                        let row_deletions: Option<RowDeletionsInit> = initialized_row_deletions
+                            .get(&scan_source_idx)
+                            .map(|x| RowDeletionsInit::Initialized(x.clone()))
+                            .or_else(|| {
+                                deletion_files_provider.spawn_row_deletions_init(
+                                    attribution.clone(),
+                                    scan_source_idx,
+                                    cloud_options,
+                                    num_pipelines,
+                                    verbose,
+                                )
+                            });
+
+                        Ok(InitializedReaderState {
+                            scan_source_idx,
+                            scan_source,
+                            reader,
+                            n_rows_in_file,
+                            row_deletions,
+                        })
+                    },
+                ))
             })
             .buffered(config.n_readers_pre_init().max(1))
     };
@@ -427,7 +443,9 @@ async fn finish_initialize_multi_scan_pipeline(
 
     let reader_starter_handle = AbortOnDropHandle::new(executor::spawn(
         TaskPriority::Low,
+        execution_state.attribution.clone(),
         ReaderStarter {
+            attribution: execution_state.attribution.clone(),
             reader_capabilities,
             n_sources: sources.len(),
 
@@ -458,6 +476,7 @@ async fn finish_initialize_multi_scan_pipeline(
 
     let attach_to_bridge_handle = AbortOnDropHandle::new(executor::spawn(
         TaskPriority::Low,
+        execution_state.attribution.clone(),
         AttachReaderToBridge {
             started_reader_rx,
             bridge_recv_port_tx,

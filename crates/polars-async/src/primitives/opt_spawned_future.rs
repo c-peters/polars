@@ -1,7 +1,7 @@
 use pin_project_lite::pin_project;
 use polars_utils::{UnitVec, unitvec};
 
-use crate::executor::{AbortOnDropHandle, TaskPriority, spawn};
+use crate::executor::{AbortOnDropHandle, TaskAttributionHandle, TaskPriority, spawn};
 
 pin_project! {
     /// Represents a future that may either be local or spawned.
@@ -28,9 +28,9 @@ where
     O: Send + 'static,
 {
     /// Spawns the future onto the async executor.
-    pub fn spawn(task_priority: TaskPriority, fut: F) -> Self {
+    pub fn spawn(task_priority: TaskPriority, attribution: TaskAttributionHandle, fut: F) -> Self {
         LocalOrSpawnedFuture::Spawned {
-            handle: AbortOnDropHandle::new(spawn(task_priority, fut)),
+            handle: AbortOnDropHandle::new(spawn(task_priority, attribution, fut)),
         }
     }
 }
@@ -63,6 +63,7 @@ where
 /// used for compute.
 pub fn parallelize_first_to_local<'i, 'o, I, F, O>(
     task_priority: TaskPriority,
+    attribution: TaskAttributionHandle,
     futures_iter: I,
 ) -> impl ExactSizeIterator<Item = impl Future<Output = O> + Send + 'static> + 'o
 where
@@ -70,11 +71,12 @@ where
     F: Future<Output = O> + Send + 'static,
     O: Send + 'static,
 {
-    parallelize_first_to_local_impl(task_priority, futures_iter).into_iter()
+    parallelize_first_to_local_impl(task_priority, attribution, futures_iter).into_iter()
 }
 
 fn parallelize_first_to_local_impl<I, F, O>(
     task_priority: TaskPriority,
+    attribution: TaskAttributionHandle,
     mut futures_iter: I,
 ) -> UnitVec<LocalOrSpawnedFuture<F, O>>
 where
@@ -99,9 +101,11 @@ where
     // * Remaining futures must all be spawned upfront into the Vec for them to run parallel.
     futures.extend([
         first_fut,
-        LocalOrSpawnedFuture::spawn(task_priority, second_fut),
+        LocalOrSpawnedFuture::spawn(task_priority, attribution.clone(), second_fut),
     ]);
-    futures.extend(futures_iter.map(|x| LocalOrSpawnedFuture::spawn(task_priority, x)));
+    futures.extend(
+        futures_iter.map(|x| LocalOrSpawnedFuture::spawn(task_priority, attribution.clone(), x)),
+    );
 
     futures
 }

@@ -89,86 +89,94 @@ impl ComputeNode for SortedUnique {
         let row_encode = self.row_encode;
 
         // Serial receiver.
-        join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-            while let Ok(morsel) = receiver.recv().await {
-                let height = morsel.height();
-                if height == 0 {
-                    continue;
-                }
-
-                let df = morsel.df().await;
-                let mut is_first_new_run = false;
-                for (key, last) in keys.iter().zip(last.iter_mut()) {
-                    let column = &df[*key];
-                    is_first_new_run |= last
-                        .take()
-                        .is_none_or(|last| column.get(0).unwrap().into_static() != last);
-                    *last = Some(column.get(height - 1).unwrap().into_static());
-                }
-                drop(df);
-
-                if distributor.send((morsel, is_first_new_run)).await.is_err() {
-                    break;
-                }
-            }
-
-            Ok(())
-        }));
-
-        // Parallel worker threads.
-        for (mut send, mut recv) in senders.into_iter().zip(distr_receivers) {
-            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                let wait_group = WaitGroup::default();
-                let mut lengths: Vec<IdxSize> = Vec::new();
-                let mut columns: Vec<Column> = Vec::new();
-
-                while let Ok((morsel, is_first_new_run)) = recv.recv().await {
-                    let mut morsel = morsel
-                        .try_map(|df| {
-                            let column = if row_encode {
-                                columns.clear();
-                                columns.extend(keys.iter().map(|i| df[*i].clone()));
-                                encode_rows_unordered(&columns)?.into_column()
-                            } else {
-                                df[keys[0]].clone()
-                            };
-
-                            lengths.clear();
-                            polars_ops::series::rle_lengths(&column, &mut lengths)?;
-
-                            if !is_first_new_run && lengths.len() == 1 {
-                                return Ok(DataFrame::empty());
-                            }
-
-                            // Build a boolean buffer: true only at the start of each new run.
-                            let mut values = BitmapBuilder::with_capacity(column.len());
-                            values.push(is_first_new_run);
-                            values.extend_constant(lengths[0] as usize - 1, false);
-                            for &length in &lengths[1..] {
-                                values.push(true);
-                                values.extend_constant(length as usize - 1, false);
-                            }
-                            let mask =
-                                BooleanChunked::from_bitmap(PlSmallStr::EMPTY, values.freeze());
-
-                            // We already parallelize, call the sequential filter.
-                            df.filter_seq(mask.as_ref())
-                        })
-                        .await?;
-
-                    if morsel.height() == 0 {
+        join_handles.push(scope.spawn_task(
+            TaskPriority::High,
+            _state.attribution.clone(),
+            async move {
+                while let Ok(morsel) = receiver.recv().await {
+                    let height = morsel.height();
+                    if height == 0 {
                         continue;
                     }
 
-                    morsel.set_consume_token(wait_group.token());
-                    if send.send(morsel).await.is_err() {
+                    let df = morsel.df().await;
+                    let mut is_first_new_run = false;
+                    for (key, last) in keys.iter().zip(last.iter_mut()) {
+                        let column = &df[*key];
+                        is_first_new_run |= last
+                            .take()
+                            .is_none_or(|last| column.get(0).unwrap().into_static() != last);
+                        *last = Some(column.get(height - 1).unwrap().into_static());
+                    }
+                    drop(df);
+
+                    if distributor.send((morsel, is_first_new_run)).await.is_err() {
                         break;
                     }
-                    wait_group.wait().await;
                 }
 
                 Ok(())
-            }));
+            },
+        ));
+
+        // Parallel worker threads.
+        for (mut send, mut recv) in senders.into_iter().zip(distr_receivers) {
+            join_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                _state.attribution.clone(),
+                async move {
+                    let wait_group = WaitGroup::default();
+                    let mut lengths: Vec<IdxSize> = Vec::new();
+                    let mut columns: Vec<Column> = Vec::new();
+
+                    while let Ok((morsel, is_first_new_run)) = recv.recv().await {
+                        let mut morsel = morsel
+                            .try_map(|df| {
+                                let column = if row_encode {
+                                    columns.clear();
+                                    columns.extend(keys.iter().map(|i| df[*i].clone()));
+                                    encode_rows_unordered(&columns)?.into_column()
+                                } else {
+                                    df[keys[0]].clone()
+                                };
+
+                                lengths.clear();
+                                polars_ops::series::rle_lengths(&column, &mut lengths)?;
+
+                                if !is_first_new_run && lengths.len() == 1 {
+                                    return Ok(DataFrame::empty());
+                                }
+
+                                // Build a boolean buffer: true only at the start of each new run.
+                                let mut values = BitmapBuilder::with_capacity(column.len());
+                                values.push(is_first_new_run);
+                                values.extend_constant(lengths[0] as usize - 1, false);
+                                for &length in &lengths[1..] {
+                                    values.push(true);
+                                    values.extend_constant(length as usize - 1, false);
+                                }
+                                let mask =
+                                    BooleanChunked::from_bitmap(PlSmallStr::EMPTY, values.freeze());
+
+                                // We already parallelize, call the sequential filter.
+                                df.filter_seq(mask.as_ref())
+                            })
+                            .await?;
+
+                        if morsel.height() == 0 {
+                            continue;
+                        }
+
+                        morsel.set_consume_token(wait_group.token());
+                        if send.send(morsel).await.is_err() {
+                            break;
+                        }
+                        wait_group.wait().await;
+                    }
+
+                    Ok(())
+                },
+            ));
         }
     }
 }

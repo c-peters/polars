@@ -171,6 +171,8 @@ impl ComputeNode for AsOfJoinNode {
         send: &mut [PortState],
         _state: &StreamingExecutionState,
     ) -> PolarsResult<()> {
+        self.right_buffer
+            .set_attribution(_state.attribution.clone());
         assert!(recv.len() == 2 && send.len() == 1);
 
         if send[0] == PortState::Done {
@@ -252,23 +254,27 @@ impl ComputeNode for AsOfJoinNode {
                 let output_seq = &mut self.output_seq;
                 let last_non_null_row_left = &mut self.last_non_null_row_left;
                 let last_non_null_row_right = &mut self.last_non_null_row_right;
-                join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                    distribute_work_task(
-                        recv_left,
-                        recv_right,
-                        distributor,
-                        left_buffer,
-                        right_buffer,
-                        output_seq,
-                        last_non_null_row_left,
-                        last_non_null_row_right,
-                        params,
-                    )
-                    .await
-                }));
+                join_handles.push(scope.spawn_task(
+                    TaskPriority::High,
+                    _state.attribution.clone(),
+                    async move {
+                        distribute_work_task(
+                            recv_left,
+                            recv_right,
+                            distributor,
+                            left_buffer,
+                            right_buffer,
+                            output_seq,
+                            last_non_null_row_left,
+                            last_non_null_row_right,
+                            params,
+                        )
+                        .await
+                    },
+                ));
 
                 join_handles.extend(dist_recv.into_iter().zip(send).map(|(recv, send)| {
-                    scope.spawn_task(TaskPriority::High, async move {
+                    scope.spawn_task(TaskPriority::High, _state.attribution.clone(), async move {
                         compute_and_emit_task(recv, send, params).await
                     })
                 }));

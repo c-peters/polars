@@ -96,88 +96,98 @@ impl ComputeNode for PeakMinMaxNode {
                     return;
                 }
 
-                join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                    let (start, seq, prev_column) = match &self.state {
-                        State::Start => unreachable!(),
-                        State::One(seq, df) => (&AnyValue::Int8(0), *seq, df),
-                        State::Two(av, seq, df) => (av, *seq, df),
-                        State::Done => unreachable!(),
-                    };
+                join_handles.push(scope.spawn_task(
+                    TaskPriority::High,
+                    _state.attribution.clone(),
+                    async move {
+                        let (start, seq, prev_column) = match &self.state {
+                            State::Start => unreachable!(),
+                            State::One(seq, df) => (&AnyValue::Int8(0), *seq, df),
+                            State::Two(av, seq, df) => (av, *seq, df),
+                            State::Done => unreachable!(),
+                        };
 
-                    let column = peaks::peak_min_max(
-                        prev_column,
-                        start,
-                        &AnyValue::Int8(0),
-                        self.is_peak_max,
-                    )?
-                    .into_column();
-                    let df = unsafe { DataFrame::new_unchecked(column.len(), vec![column]) };
-                    _ = send
-                        .send(Morsel::new_unregistered(df, seq, SourceToken::new()))
-                        .await;
+                        let column = peaks::peak_min_max(
+                            prev_column,
+                            start,
+                            &AnyValue::Int8(0),
+                            self.is_peak_max,
+                        )?
+                        .into_column();
+                        let df = unsafe { DataFrame::new_unchecked(column.len(), vec![column]) };
+                        _ = send
+                            .send(Morsel::new_unregistered(df, seq, SourceToken::new()))
+                            .await;
 
-                    self.state = State::Done;
-                    Ok(())
-                }));
+                        self.state = State::Done;
+                        Ok(())
+                    },
+                ));
             },
 
             Some(recv) => {
                 let mut recv = recv.serial();
-                join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                    let source_token = SourceToken::new();
+                join_handles.push(scope.spawn_task(
+                    TaskPriority::High,
+                    _state.attribution.clone(),
+                    async move {
+                        let source_token = SourceToken::new();
 
-                    while let Ok(m) = recv.recv().await {
-                        let (sf, seq, in_source_token, in_wait_token) = m.into_inner();
-                        let df = sf.into_df().await;
-                        drop(in_wait_token);
-                        if df.height() == 0 {
-                            continue;
-                        }
-
-                        assert_eq!(df.width(), 1);
-                        let column = &df[0];
-
-                        let (start, prev_seq, prev_column) = match &self.state {
-                            State::Start => {
-                                self.state = State::One(seq, column.clone());
+                        while let Ok(m) = recv.recv().await {
+                            let (sf, seq, in_source_token, in_wait_token) = m.into_inner();
+                            let df = sf.into_df().await;
+                            drop(in_wait_token);
+                            if df.height() == 0 {
                                 continue;
-                            },
-                            State::One(prev_seq, prev_column) => {
-                                (&AnyValue::Int8(0), *prev_seq, prev_column)
-                            },
-                            State::Two(prev_start, prev_seq, prev_column) => {
-                                (prev_start, *prev_seq, prev_column)
-                            },
-                            State::Done => unreachable!(),
-                        };
-                        let end = &column.get(0).unwrap();
-                        let out = peaks::peak_min_max(prev_column, start, end, self.is_peak_max)?
-                            .into_column();
+                            }
 
-                        let wg = WaitGroup::default();
-                        let out = unsafe { DataFrame::new_unchecked(out.len(), vec![out]) };
-                        let mut m = Morsel::new_unregistered(out, prev_seq, source_token.clone());
-                        m.set_consume_token(wg.token());
+                            assert_eq!(df.width(), 1);
+                            let column = &df[0];
 
-                        if send.send(m).await.is_err() {
-                            self.state = State::Done;
-                            break;
+                            let (start, prev_seq, prev_column) = match &self.state {
+                                State::Start => {
+                                    self.state = State::One(seq, column.clone());
+                                    continue;
+                                },
+                                State::One(prev_seq, prev_column) => {
+                                    (&AnyValue::Int8(0), *prev_seq, prev_column)
+                                },
+                                State::Two(prev_start, prev_seq, prev_column) => {
+                                    (prev_start, *prev_seq, prev_column)
+                                },
+                                State::Done => unreachable!(),
+                            };
+                            let end = &column.get(0).unwrap();
+                            let out =
+                                peaks::peak_min_max(prev_column, start, end, self.is_peak_max)?
+                                    .into_column();
+
+                            let wg = WaitGroup::default();
+                            let out = unsafe { DataFrame::new_unchecked(out.len(), vec![out]) };
+                            let mut m =
+                                Morsel::new_unregistered(out, prev_seq, source_token.clone());
+                            m.set_consume_token(wg.token());
+
+                            if send.send(m).await.is_err() {
+                                self.state = State::Done;
+                                break;
+                            }
+
+                            wg.wait().await;
+                            if source_token.stop_requested() {
+                                in_source_token.stop();
+                            }
+
+                            let prev_end = prev_column
+                                .get(prev_column.len() - 1)
+                                .unwrap()
+                                .to_physical()
+                                .into_static();
+                            self.state = State::Two(prev_end, seq, column.clone());
                         }
-
-                        wg.wait().await;
-                        if source_token.stop_requested() {
-                            in_source_token.stop();
-                        }
-
-                        let prev_end = prev_column
-                            .get(prev_column.len() - 1)
-                            .unwrap()
-                            .to_physical()
-                            .into_static();
-                        self.state = State::Two(prev_end, seq, column.clone());
-                    }
-                    Ok(())
-                }));
+                        Ok(())
+                    },
+                ));
             },
         }
     }

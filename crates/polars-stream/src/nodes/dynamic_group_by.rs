@@ -322,36 +322,42 @@ impl ComputeNode for DynamicGroupBy {
             assert!(self.buf_df.height() > 0);
             assert!(self.slice_length > 0);
             let mut send = send_ports[0].take().unwrap().serial();
-            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                if let Some((windows, lower_bound, upper_bound, df)) = self.next_windows(true)? {
-                    let df = Self::evaluate_one(
-                        windows,
-                        lower_bound,
-                        upper_bound,
-                        &self.aggs,
-                        &state.in_memory_exec_state,
-                        df,
-                        self.group_by.as_deref(),
-                        self.index_column.as_str(),
-                        self.index_column_idx,
-                        &self.space,
-                        self.label,
-                        self.include_boundaries,
-                    )
-                    .await?;
-
-                    _ = send
-                        .send(Morsel::new_unregistered(
+            join_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                state.attribution.clone(),
+                async move {
+                    if let Some((windows, lower_bound, upper_bound, df)) =
+                        self.next_windows(true)?
+                    {
+                        let df = Self::evaluate_one(
+                            windows,
+                            lower_bound,
+                            upper_bound,
+                            &self.aggs,
+                            &state.in_memory_exec_state,
                             df,
-                            self.seq.successor().offset_by_u64(self.seq_offset.load()),
-                            SourceToken::new(),
-                        ))
-                        .await;
-                }
+                            self.group_by.as_deref(),
+                            self.index_column.as_str(),
+                            self.index_column_idx,
+                            &self.space,
+                            self.label,
+                            self.include_boundaries,
+                        )
+                        .await?;
 
-                self.buf_df = self.buf_df.clear();
-                Ok(())
-            }));
+                        _ = send
+                            .send(Morsel::new_unregistered(
+                                df,
+                                self.seq.successor().offset_by_u64(self.seq_offset.load()),
+                                SourceToken::new(),
+                            ))
+                            .await;
+                    }
+
+                    self.buf_df = self.buf_df.clear();
+                    Ok(())
+                },
+            ));
             return;
         };
 
@@ -370,6 +376,7 @@ impl ComputeNode for DynamicGroupBy {
         join_handles.extend(rxs.into_iter().zip(send).map(|(mut rx, mut tx)| {
             let wg = WaitGroup::default();
             let aggs = self.aggs.clone();
+            let attribution = state.attribution.clone();
             let state = state.in_memory_exec_state.split();
 
             let group_by = self.group_by.clone();
@@ -379,7 +386,7 @@ impl ComputeNode for DynamicGroupBy {
             let label = self.label;
             let include_boundaries = self.include_boundaries;
 
-            scope.spawn_task(TaskPriority::High, async move {
+            scope.spawn_task(TaskPriority::High, attribution.clone(), async move {
                 while let Ok((mut morsel, (windows, lower_bound, upper_bound))) = rx.recv().await {
                     morsel = morsel
                         .async_try_map::<PolarsError, _, _>(async |df| {
@@ -415,46 +422,52 @@ impl ComputeNode for DynamicGroupBy {
         // Distributor task.
         //
         // This finds boundaries to distribute to worker threads over.
-        join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-            while let Ok(morsel) = recv.recv().await
-                && self.slice_length > 0
-                && !self.windower.is_done()
-            {
-                let (sf, seq, source_token, wait_token) = morsel.into_inner();
-                let df = sf.into_df().await;
-                self.seq = seq;
-                drop(wait_token);
+        join_handles.push(scope.spawn_task(
+            TaskPriority::High,
+            state.attribution.clone(),
+            async move {
+                while let Ok(morsel) = recv.recv().await
+                    && self.slice_length > 0
+                    && !self.windower.is_done()
+                {
+                    let (sf, seq, source_token, wait_token) = morsel.into_inner();
+                    let df = sf.into_df().await;
+                    self.seq = seq;
+                    drop(wait_token);
 
-                if df.height() == 0 {
-                    continue;
-                }
+                    if df.height() == 0 {
+                        continue;
+                    }
 
-                let morsel_index_column = df.column(&self.index_column)?;
-                polars_ensure!(
-                    morsel_index_column.null_count() == 0,
-                    ComputeError: "null values in `group_by_dynamic` not supported, fill nulls."
-                );
+                    let morsel_index_column = df.column(&self.index_column)?;
+                    polars_ensure!(
+                        morsel_index_column.null_count() == 0,
+                        ComputeError: "null values in `group_by_dynamic` not supported, fill nulls."
+                    );
 
-                let morsel_index_column = self.space.cast_to_space(morsel_index_column)?;
+                    let morsel_index_column = self.space.cast_to_space(morsel_index_column)?;
 
-                self.buf_df.vstack_mut_owned(df)?;
-                self.buf_index_column.append_owned(morsel_index_column)?;
+                    self.buf_df.vstack_mut_owned(df)?;
+                    self.buf_index_column.append_owned(morsel_index_column)?;
 
-                if let Some((windows, lower_bound, upper_bound, df)) = self.next_windows(false)? {
-                    if distributor
-                        .send((
-                            Morsel::new_unregistered(df, seq, source_token),
-                            (windows, lower_bound, upper_bound),
-                        ))
-                        .await
-                        .is_err()
+                    if let Some((windows, lower_bound, upper_bound, df)) =
+                        self.next_windows(false)?
                     {
-                        break;
+                        if distributor
+                            .send((
+                                Morsel::new_unregistered(df, seq, source_token),
+                                (windows, lower_bound, upper_bound),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
-            }
 
-            Ok(())
-        }));
+                Ok(())
+            },
+        ));
     }
 }

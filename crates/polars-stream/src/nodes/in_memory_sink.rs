@@ -36,6 +36,7 @@ impl ComputeNode for InMemorySinkNode {
         send: &mut [PortState],
         _state: &StreamingExecutionState,
     ) -> PolarsResult<()> {
+        self.spill_ctx.set_attribution(_state.attribution.clone());
         assert!(send.is_empty());
         assert!(recv.len() == 1);
 
@@ -64,17 +65,21 @@ impl ComputeNode for InMemorySinkNode {
 
         for mut recv in receivers {
             let slf = &*self;
-            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                let mut morsels = Vec::new();
-                while let Ok(mut morsel) = recv.recv().await {
-                    morsel.take_consume_token();
-                    slf.spill_ctx.register(morsel.sf()).await;
-                    morsels.push(morsel);
-                }
+            join_handles.push(scope.spawn_task(
+                TaskPriority::High,
+                _state.attribution.clone(),
+                async move {
+                    let mut morsels = Vec::new();
+                    while let Ok(mut morsel) = recv.recv().await {
+                        morsel.take_consume_token();
+                        slf.spill_ctx.register(morsel.sf()).await;
+                        morsels.push(morsel);
+                    }
 
-                slf.morsels_per_pipe.lock().push(morsels);
-                Ok(())
-            }));
+                    slf.morsels_per_pipe.lock().push(morsels);
+                    Ok(())
+                },
+            ));
         }
     }
 

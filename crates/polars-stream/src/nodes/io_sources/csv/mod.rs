@@ -162,6 +162,7 @@ impl FileReader for CsvFileReader {
         } = self.init_data.clone().unwrap();
 
         let BeginReadArgs {
+            attribution,
             projection: Projection::Plain(projected_schema),
             // Because we currently only support PRE_SLICE we don't need to handle row index here.
             row_index,
@@ -323,7 +324,7 @@ impl FileReader for CsvFileReader {
         // Task: Line batch source.
         // Create and send newline-aligned batches. Create chunk_reader for decoder.
         let line_batch_source_handle =
-            AbortOnDropHandle::new(spawn(TaskPriority::Low, async move {
+            AbortOnDropHandle::new(spawn(TaskPriority::Low, attribution.clone(), async move {
                 let pre_read_result = infer_schema_rx.recv().await.map_err(
                     |_| polars_err!(ComputeError: "CSV pre-read task panicked or was dropped"),
                 )?;
@@ -411,7 +412,7 @@ impl FileReader for CsvFileReader {
                 // Note: We don't use this (it is handled by the bridge). But morsels require a source token.
                 let source_token = SourceToken::new();
 
-                AbortOnDropHandle::new(spawn(TaskPriority::Low, async move {
+                AbortOnDropHandle::new(spawn(TaskPriority::Low, attribution.clone(), async move {
                     let chunk_reader = chunk_reader_shared.await.map_err(
                         |_| polars_err!(ComputeError: "CSV pipeline dropped unexpectedly"),
                     )??;
@@ -478,7 +479,7 @@ impl FileReader for CsvFileReader {
 
         Ok((
             rx,
-            spawn(TaskPriority::Low, async move {
+            spawn(TaskPriority::Low, attribution.clone(), async move {
                 let mut row_position: usize = 0;
 
                 for handle in line_batch_decode_handles {

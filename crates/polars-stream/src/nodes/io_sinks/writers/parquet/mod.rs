@@ -75,6 +75,7 @@ impl FileWriterStarter for ParquetWriterStarter {
 
     fn start_file_writer(
         &self,
+        attribution: polars_async::executor::TaskAttributionHandle,
         morsel_rx: connector::Receiver<SinkMorsel>,
         file: FileOpenTaskHandle,
         num_pipelines: std::num::NonZeroUsize,
@@ -132,7 +133,9 @@ impl FileWriterStarter for ParquetWriterStarter {
         let arrow_schema = Arc::clone(&self.arrow_schema);
         let compute_handle = executor::AbortOnDropHandle::new(executor::spawn(
             TaskPriority::High,
+            attribution.clone(),
             row_group_encoder::RowGroupEncoder {
+                attribution: attribution.clone(),
                 morsel_rx,
                 encoded_row_group_tx,
                 arrow_schema,
@@ -144,10 +147,14 @@ impl FileWriterStarter for ParquetWriterStarter {
             .run(),
         ));
 
-        Ok(executor::spawn(TaskPriority::Low, async move {
-            compute_handle.await?;
-            io_handle.await.unwrap()?;
-            Ok(())
-        }))
+        Ok(executor::spawn(
+            TaskPriority::Low,
+            attribution.clone(),
+            async move {
+                compute_handle.await?;
+                io_handle.await.unwrap()?;
+                Ok(())
+            },
+        ))
     }
 }

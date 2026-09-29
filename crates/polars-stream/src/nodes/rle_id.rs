@@ -57,55 +57,60 @@ impl ComputeNode for RleIdNode {
         let mut recv = recv_ports[0].take().unwrap().serial();
         let mut send = send_ports[0].take().unwrap().serial();
 
-        join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-            let mut lengths = Vec::new();
-            while let Ok(mut m) = recv.recv().await {
-                if m.height() == 0 {
-                    continue;
-                }
-                let mut df = m.df_mut().await;
-
-                assert_eq!(df.width(), 1);
-                let column = &df[0];
-
-                let name = column.name().clone();
-
-                lengths.clear();
-                polars_ops::series::rle_lengths(column, &mut lengths)?;
-
-                // If the last value seen is different from this first value here, bump the index
-                // by 1.
-                if let Some(last) = self.last.take() {
-                    let fst = Scalar::new(self.dtype.clone(), column.get(0).unwrap().into_static());
-                    let last = Scalar::new(self.dtype.clone(), last);
-                    self.index += IdxSize::from(fst != last);
-                }
-                self.last = Some(column.get(column.len() - 1).unwrap().into_static());
-
-                let column = if lengths.len() == 1 {
-                    // If we only have one unique value, just give a Scalar column.
-                    Column::new_scalar(name, Scalar::from(self.index), lengths[0] as usize)
-                } else {
-                    let mut values = Vec::with_capacity(column.len());
-                    values.extend(std::iter::repeat_n(self.index, lengths[0] as usize));
-                    for length in lengths.iter().skip(1) {
-                        self.index += 1;
-                        values.extend(std::iter::repeat_n(self.index, *length as usize));
+        join_handles.push(scope.spawn_task(
+            TaskPriority::High,
+            _state.attribution.clone(),
+            async move {
+                let mut lengths = Vec::new();
+                while let Ok(mut m) = recv.recv().await {
+                    if m.height() == 0 {
+                        continue;
                     }
-                    let mut column = Column::new(name, values);
-                    column.set_sorted_flag(polars_core::series::IsSorted::Ascending);
-                    column
-                };
+                    let mut df = m.df_mut().await;
 
-                *df = unsafe { DataFrame::new_unchecked(column.len(), vec![column]) };
+                    assert_eq!(df.width(), 1);
+                    let column = &df[0];
 
-                drop(df);
-                if send.send(m).await.is_err() {
-                    break;
+                    let name = column.name().clone();
+
+                    lengths.clear();
+                    polars_ops::series::rle_lengths(column, &mut lengths)?;
+
+                    // If the last value seen is different from this first value here, bump the index
+                    // by 1.
+                    if let Some(last) = self.last.take() {
+                        let fst =
+                            Scalar::new(self.dtype.clone(), column.get(0).unwrap().into_static());
+                        let last = Scalar::new(self.dtype.clone(), last);
+                        self.index += IdxSize::from(fst != last);
+                    }
+                    self.last = Some(column.get(column.len() - 1).unwrap().into_static());
+
+                    let column = if lengths.len() == 1 {
+                        // If we only have one unique value, just give a Scalar column.
+                        Column::new_scalar(name, Scalar::from(self.index), lengths[0] as usize)
+                    } else {
+                        let mut values = Vec::with_capacity(column.len());
+                        values.extend(std::iter::repeat_n(self.index, lengths[0] as usize));
+                        for length in lengths.iter().skip(1) {
+                            self.index += 1;
+                            values.extend(std::iter::repeat_n(self.index, *length as usize));
+                        }
+                        let mut column = Column::new(name, values);
+                        column.set_sorted_flag(polars_core::series::IsSorted::Ascending);
+                        column
+                    };
+
+                    *df = unsafe { DataFrame::new_unchecked(column.len(), vec![column]) };
+
+                    drop(df);
+                    if send.send(m).await.is_err() {
+                        break;
+                    }
                 }
-            }
 
-            Ok(())
-        }));
+                Ok(())
+            },
+        ));
     }
 }

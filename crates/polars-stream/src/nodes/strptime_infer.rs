@@ -191,54 +191,58 @@ impl ComputeNode for StrptimeInferNode {
                 let options = &self.options;
                 let input_name = &self.input_name;
                 let infer_slot = &mut self.infer;
-                join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                    while let Ok(morsel) = recv.recv().await {
-                        if infer_slot.is_none() {
-                            let df = morsel.df().await;
-                            let ca = df.columns()[0].str()?;
-                            if ca.null_count() != ca.len() {
-                                *infer_slot = FormatInfer::try_new(ca, dtype, options)?;
+                join_handles.push(scope.spawn_task(
+                    TaskPriority::High,
+                    _state.attribution.clone(),
+                    async move {
+                        while let Ok(morsel) = recv.recv().await {
+                            if infer_slot.is_none() {
+                                let df = morsel.df().await;
+                                let ca = df.columns()[0].str()?;
+                                if ca.null_count() != ca.len() {
+                                    *infer_slot = FormatInfer::try_new(ca, dtype, options)?;
 
-                                let unit = if matches!(dtype, DataType::Time) {
-                                    "time"
-                                } else {
-                                    "date"
-                                };
-                                polars_ensure!(
-                                    infer_slot.is_some() || !options.strict,
-                                    parse_fmt_idk = unit
-                                );
+                                    let unit = if matches!(dtype, DataType::Time) {
+                                        "time"
+                                    } else {
+                                        "date"
+                                    };
+                                    polars_ensure!(
+                                        infer_slot.is_some() || !options.strict,
+                                        parse_fmt_idk = unit
+                                    );
+                                }
+                            }
+
+                            // Request a stop, so switch to parsing in parallel.
+                            if infer_slot.is_some() {
+                                morsel.source_token().stop();
+                            }
+
+                            let morsel = morsel
+                                .try_map(|df| {
+                                    let cols = df.columns();
+                                    if let Some(ref mut infer) = *infer_slot {
+                                        infer
+                                            .apply(&cols[0], &ambiguous, options.strict, input_name)
+                                            .map(Column::into_frame)
+                                    } else {
+                                        Ok(Column::full_null(
+                                            cols[0].name().clone(),
+                                            cols[0].len(),
+                                            dtype,
+                                        )
+                                        .into_frame())
+                                    }
+                                })
+                                .await?;
+                            if send.send(morsel).await.is_err() {
+                                break;
                             }
                         }
-
-                        // Request a stop, so switch to parsing in parallel.
-                        if infer_slot.is_some() {
-                            morsel.source_token().stop();
-                        }
-
-                        let morsel = morsel
-                            .try_map(|df| {
-                                let cols = df.columns();
-                                if let Some(ref mut infer) = *infer_slot {
-                                    infer
-                                        .apply(&cols[0], &ambiguous, options.strict, input_name)
-                                        .map(Column::into_frame)
-                                } else {
-                                    Ok(Column::full_null(
-                                        cols[0].name().clone(),
-                                        cols[0].len(),
-                                        dtype,
-                                    )
-                                    .into_frame())
-                                }
-                            })
-                            .await?;
-                        if send.send(morsel).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(())
-                }));
+                        Ok(())
+                    },
+                ));
             },
 
             Phase::Parsing => {
@@ -249,22 +253,26 @@ impl ComputeNode for StrptimeInferNode {
                     let input_name = self.input_name.clone();
                     let ambiguous = ambiguous.clone();
                     let mut infer = self.infer.clone().unwrap();
-                    join_handles.push(scope.spawn_task(TaskPriority::High, async move {
-                        while let Ok(morsel) = recv.recv().await {
-                            let morsel = morsel
-                                .try_map(|df| {
-                                    let cols = df.columns();
-                                    infer
-                                        .apply(&cols[0], &ambiguous, strict, &input_name)
-                                        .map(Column::into_frame)
-                                })
-                                .await?;
-                            if send.send(morsel).await.is_err() {
-                                break;
+                    join_handles.push(scope.spawn_task(
+                        TaskPriority::High,
+                        _state.attribution.clone(),
+                        async move {
+                            while let Ok(morsel) = recv.recv().await {
+                                let morsel = morsel
+                                    .try_map(|df| {
+                                        let cols = df.columns();
+                                        infer
+                                            .apply(&cols[0], &ambiguous, strict, &input_name)
+                                            .map(Column::into_frame)
+                                    })
+                                    .await?;
+                                if send.send(morsel).await.is_err() {
+                                    break;
+                                }
                             }
-                        }
-                        Ok(())
-                    }));
+                            Ok(())
+                        },
+                    ));
                 }
             },
         }
