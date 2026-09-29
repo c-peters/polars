@@ -624,15 +624,18 @@ mod attribution_tests {
 
     use super::*;
 
-    struct Owner;
+    #[derive(Default)]
+    struct Owner(std::sync::atomic::AtomicUsize);
     impl TaskAttribution for Owner {
-        fn task_spawned(&self, _: &Arc<TaskMetrics>) {}
+        fn task_spawned(&self, _: &Arc<TaskMetrics>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     #[test]
     fn spill_context_reuse_releases_and_replaces_owner() {
-        let a = Arc::new(Owner);
-        let b = Arc::new(Owner);
+        let a = Arc::new(Owner::default());
+        let b = Arc::new(Owner::default());
         let ctx = MostRecentSpillContext::new("owner-a".into());
         ctx.set_attribution(TaskAttributionHandle::new(a.clone()));
         assert_eq!(Arc::strong_count(&a), 2);
@@ -646,5 +649,20 @@ mod attribution_tests {
         drop(ctx);
         // Arena slots are leaked for reuse, but must not retain the query owner.
         assert_eq!(Arc::strong_count(&b), 1);
+
+        let ctx_a = MostRecentSpillContext::new("independent-a".into());
+        let ctx_b = MostRecentSpillContext::new("independent-b".into());
+        ctx_a.set_attribution(TaskAttributionHandle::new(a.clone()));
+        ctx_b.set_attribution(TaskAttributionHandle::new(b.clone()));
+        polars_async::executor::track_task_metrics(true);
+        polars_core::runtime::ASYNC.block_in_place_on(async {
+            polars_async::executor::spawn(TaskPriority::High, ctx_a.0.attribution(), async {})
+                .await;
+            polars_async::executor::spawn(TaskPriority::High, ctx_b.0.attribution(), async {})
+                .await;
+        });
+        polars_async::executor::track_task_metrics(false);
+        assert_eq!(a.0.load(Ordering::Relaxed), 1);
+        assert_eq!(b.0.load(Ordering::Relaxed), 1);
     }
 }

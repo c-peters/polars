@@ -32,8 +32,15 @@ fn explicit_ownership_survives_yields_handoffs_and_scopes() {
         let tokio = tokio::runtime::Handle::current();
         let child_owner = owner_a.clone();
         let other_owner = owner_b.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let concurrent_owner = owner_b.clone();
+        let concurrent_parent = spawn(TaskPriority::High, owner_b.clone(), async move {
+            spawn(TaskPriority::High, concurrent_owner, async {}).await;
+            ready_tx.send(()).unwrap();
+        });
         let parent = spawn(TaskPriority::High, owner_a.clone(), async move {
             tokio::task::yield_now().await;
+            ready_rx.await.unwrap();
             spawn(TaskPriority::High, child_owner.clone(), async {}).await;
             spawn(
                 TaskPriority::High,
@@ -57,6 +64,7 @@ fn explicit_ownership_survives_yields_handoffs_and_scopes() {
                 .any(|m| Arc::ptr_eq(m, parent.metrics().unwrap()))
         );
         parent.await;
+        concurrent_parent.await;
         LocalOrSpawnedFuture::new_local(async {}).await;
         LocalOrSpawnedFuture::spawn(TaskPriority::High, owner_b.clone(), async {}).await;
         for f in parallelize_first_to_local(
@@ -68,22 +76,24 @@ fn explicit_ownership_survives_yields_handoffs_and_scopes() {
         }
     });
     let borrowed = String::from("scoped");
+    let cancelled_dropped = AtomicBool::new(false);
     task_scope(|scope| {
         runtime.block_on(
             scope.spawn_task(TaskPriority::High, owner_a.clone(), async {
                 assert_eq!(&borrowed, "scoped");
             }),
         );
-        let cancelled = scope.spawn_task(
-            TaskPriority::High,
-            owner_b.clone(),
-            std::future::pending::<()>(),
-        );
+        let drop_marker = WithDrop::new((), |_| cancelled_dropped.store(true, Ordering::Relaxed));
+        let cancelled = scope.spawn_task(TaskPriority::High, owner_b.clone(), async move {
+            let _drop_marker = drop_marker;
+            std::future::pending::<()>().await;
+        });
         cancelled.cancel_handle().cancel();
         drop(cancelled);
     });
     assert_eq!(a.tasks.lock().len(), 4);
-    assert_eq!(b.tasks.lock().len(), 5);
+    assert_eq!(b.tasks.lock().len(), 7);
+    assert!(cancelled_dropped.load(Ordering::Relaxed));
     assert!(a.polls.load(Ordering::Relaxed) > 0);
     assert!(b.polls.load(Ordering::Relaxed) > 0);
     // Each task has a distinct metric allocation, even across owners.

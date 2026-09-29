@@ -166,7 +166,7 @@ mod tests {
             .group_by([col("category")])
             .agg([col("calories").sum()]);
         let (result, events) = run_observed_on(lf, true, Engine::Streaming);
-        assert!(result.is_ok(), "{result:?}");
+        assert!(result.is_ok(), "{:?}", result.err());
         let snapshot = events
             .iter()
             .find_map(|event| match event {
