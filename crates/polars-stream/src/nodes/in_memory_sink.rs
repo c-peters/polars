@@ -36,7 +36,6 @@ impl ComputeNode for InMemorySinkNode {
         send: &mut [PortState],
         _state: &StreamingExecutionState,
     ) -> PolarsResult<()> {
-        self.spill_ctx.set_attribution(_state.attribution.clone());
         assert!(send.is_empty());
         assert!(recv.len() == 1);
 

@@ -189,10 +189,6 @@ impl ComputeNode for MergeJoinNode {
         send: &mut [PortState],
         state: &StreamingExecutionState,
     ) -> PolarsResult<()> {
-        self.build_unmerged
-            .set_attribution(state.attribution.clone());
-        self.probe_unmerged
-            .set_attribution(state.attribution.clone());
         use MergeJoinState::*;
 
         assert!(recv.len() == 2 && send.len() == 1);

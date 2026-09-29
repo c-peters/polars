@@ -232,9 +232,6 @@ impl ComputeNode for ShiftNode {
                 send[0] = PortState::Blocked;
             },
             Self::Shifting(shift_state) => {
-                shift_state
-                    .spill_ctx
-                    .set_attribution(state.attribution.clone());
                 if recv[0] == PortState::Done && shift_state.rows_sent < shift_state.rows_received {
                     send[0] = PortState::Ready;
                 } else {

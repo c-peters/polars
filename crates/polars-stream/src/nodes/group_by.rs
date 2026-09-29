@@ -743,7 +743,6 @@ impl ComputeNode for GroupByNode {
         send: &mut [PortState],
         state: &StreamingExecutionState,
     ) -> PolarsResult<()> {
-        self.spill_ctx.set_attribution(state.attribution.clone());
         assert!(recv.len() == self.num_inputs && send.len() == 1);
 
         // State transitions.

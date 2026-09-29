@@ -162,7 +162,6 @@ impl ComputeNode for ZipNode {
         send: &mut [PortState],
         _state: &StreamingExecutionState,
     ) -> PolarsResult<()> {
-        self.spill_ctx.set_attribution(_state.attribution.clone());
         assert!(send.len() == 1);
         assert!(recv.len() == self.input_heads.len());
 

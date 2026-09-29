@@ -52,7 +52,6 @@ impl ComputeNode for NegativeSliceNode {
         send: &mut [PortState],
         state: &StreamingExecutionState,
     ) -> PolarsResult<()> {
-        self.spill_ctx.set_attribution(state.attribution.clone());
         use NegativeSliceState::*;
 
         if send[0] == PortState::Done || self.length == 0 {

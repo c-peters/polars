@@ -171,8 +171,6 @@ impl ComputeNode for AsOfJoinNode {
         send: &mut [PortState],
         _state: &StreamingExecutionState,
     ) -> PolarsResult<()> {
-        self.right_buffer
-            .set_attribution(_state.attribution.clone());
         assert!(recv.len() == 2 && send.len() == 1);
 
         if send[0] == PortState::Done {

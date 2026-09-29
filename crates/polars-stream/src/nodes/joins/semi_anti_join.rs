@@ -407,13 +407,11 @@ impl SampleState {
         params.left_is_build = Some(left_is_build);
         let mut sampled_build_morsels = BufferedStream::new(
             "semi-anti-join-left-sample".into(),
-            state.attribution.clone(),
             core::mem::take(&mut self.left),
             MorselSeq::default(),
         );
         let mut sampled_probe_morsels = BufferedStream::new(
             "semi-anti-join-right-sample".into(),
-            state.attribution.clone(),
             core::mem::take(&mut self.right),
             MorselSeq::default(),
         );
@@ -1044,7 +1042,6 @@ impl ComputeNode for SemiAntiJoinNode {
         send: &mut [PortState],
         state: &StreamingExecutionState,
     ) -> PolarsResult<()> {
-        self.spill_ctx.set_attribution(state.attribution.clone());
         assert!(recv.len() == 2 && send.len() == 1);
 
         // If the output doesn't want any more data, transition to being done.

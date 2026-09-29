@@ -168,16 +168,10 @@ struct BufferedStream {
 }
 
 impl BufferedStream {
-    pub fn new(
-        name: PlSmallStr,
-        attribution: polars_async::executor::TaskAttributionHandle,
-        morsels: Vec<Morsel>,
-        start_offset: MorselSeq,
-    ) -> Self {
+    pub fn new(name: PlSmallStr, morsels: Vec<Morsel>, start_offset: MorselSeq) -> Self {
         // Relabel so we can insert into parallel streams later.
         let mut seq = start_offset;
         let ctx = MostRecentSpillContext::new(name);
-        ctx.set_attribution(attribution);
         let queue = ArrayQueue::new(morsels.len().max(1));
         for morsel in morsels {
             let sf = SpillFrame::new_blocking(morsel.into_df_blocking(), &ctx);

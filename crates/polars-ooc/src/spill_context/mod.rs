@@ -193,7 +193,6 @@ struct SharedState {
 }
 
 pub(crate) struct SpillContextInner {
-    attribution: Mutex<polars_async::executor::TaskAttributionHandle>,
     staging: ThreadLocal<Mutex<LocalStagingArea>>,
     staging_empty: AtomicBool,
     shared: Mutex<SharedState>,
@@ -207,7 +206,6 @@ impl SpillContextInner {
     fn new(name: PlSmallStr, policy: SpillContextPolicy) -> Self {
         let ctx_id = new_context_id();
         Self {
-            attribution: Mutex::default(),
             staging: ThreadLocal::default(),
             staging_empty: AtomicBool::new(true),
             shared: Mutex::default(),
@@ -266,7 +264,6 @@ impl SpillContextInner {
     }
 
     fn reset(&self, name: PlSmallStr, policy: SpillContextPolicy) {
-        *self.attribution.lock().unwrap() = Default::default();
         let ctx_id = new_context_id();
         let old_ctx_id = self.context_id.swap(ctx_id, Ordering::Relaxed);
         self.policy.store(policy as u8, Ordering::Relaxed);
@@ -367,14 +364,11 @@ impl SpillContextInner {
             prefetched = true;
             self.stats.add_prefetch_start();
             let prefetch_fut = token.prefetch(); // Create fut outside of spawn to update statistics now.
-            polars_async::executor::spawn(
-                TaskPriority::Low,
-                self.attribution.lock().unwrap().clone(),
-                async move {
-                    prefetch_fut.await;
-                    drop(permit);
-                },
-            );
+            // Background prefetch work is intentionally unattributed.
+            polars_async::executor::spawn(TaskPriority::Low, Default::default(), async move {
+                prefetch_fut.await;
+                drop(permit);
+            });
         }
 
         if prefetched {
@@ -427,10 +421,6 @@ impl StrongSpillContext {
 }
 
 impl StrongSpillContext {
-    pub(crate) fn attribution(&self) -> polars_async::executor::TaskAttributionHandle {
-        self.0.attribution.lock().unwrap().clone()
-    }
-
     pub fn stats(&self) -> &Arc<SpillContextStatistics> {
         self.0.stats()
     }
@@ -447,7 +437,6 @@ impl Drop for StrongSpillContext {
     fn drop(&mut self) {
         if self.0.refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.0.stats().on_drop();
-            *self.0.attribution.lock().unwrap() = Default::default();
             SPILL_CONTEXT_REUSE_ARENA.lock().unwrap().push(self.0);
         }
     }
@@ -517,11 +506,6 @@ pub trait ParameterFreeSpillContext {
 pub struct MostRecentSpillContext(StrongSpillContext);
 
 impl MostRecentSpillContext {
-    /// Assign the owner before registering this node's spillable data.
-    pub fn set_attribution(&self, attribution: polars_async::executor::TaskAttributionHandle) {
-        *self.0.0.attribution.lock().unwrap() = attribution;
-    }
-
     pub fn new(name: PlSmallStr) -> Self {
         Self(StrongSpillContext::new(
             name,
@@ -554,11 +538,6 @@ impl Debug for MostRecentSpillContext {
 pub struct LeastRecentSpillContext(StrongSpillContext);
 
 impl LeastRecentSpillContext {
-    /// Assign the owner before registering this node's spillable data.
-    pub fn set_attribution(&self, attribution: polars_async::executor::TaskAttributionHandle) {
-        *self.0.0.attribution.lock().unwrap() = attribution;
-    }
-
     pub fn new(name: PlSmallStr) -> Self {
         Self(StrongSpillContext::new(
             name,
@@ -590,11 +569,6 @@ impl Debug for LeastRecentSpillContext {
 pub struct RandomSpillContext(StrongSpillContext);
 
 impl RandomSpillContext {
-    /// Assign the owner before registering this node's spillable data.
-    pub fn set_attribution(&self, attribution: polars_async::executor::TaskAttributionHandle) {
-        *self.0.0.attribution.lock().unwrap() = attribution;
-    }
-
     pub fn new(name: PlSmallStr) -> Self {
         Self(StrongSpillContext::new(name, SpillContextPolicy::Random))
     }
@@ -615,54 +589,5 @@ impl Debug for RandomSpillContext {
         f.debug_struct("RandomSpillContext")
             .field("name", &self.0.0.stats.name())
             .finish()
-    }
-}
-
-#[cfg(test)]
-mod attribution_tests {
-    use polars_async::executor::{TaskAttribution, TaskAttributionHandle, TaskMetrics};
-
-    use super::*;
-
-    #[derive(Default)]
-    struct Owner(std::sync::atomic::AtomicUsize);
-    impl TaskAttribution for Owner {
-        fn task_spawned(&self, _: &Arc<TaskMetrics>) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    #[test]
-    fn spill_context_reuse_releases_and_replaces_owner() {
-        let a = Arc::new(Owner::default());
-        let b = Arc::new(Owner::default());
-        let ctx = MostRecentSpillContext::new("owner-a".into());
-        ctx.set_attribution(TaskAttributionHandle::new(a.clone()));
-        assert_eq!(Arc::strong_count(&a), 2);
-        // Reset the same arena slot, as reuse does: stale query ownership must disappear.
-        ctx.0
-            .0
-            .reset("owner-b".into(), SpillContextPolicy::MostRecent);
-        assert_eq!(Arc::strong_count(&a), 1);
-        ctx.set_attribution(TaskAttributionHandle::new(b.clone()));
-        assert_eq!(Arc::strong_count(&b), 2);
-        drop(ctx);
-        // Arena slots are leaked for reuse, but must not retain the query owner.
-        assert_eq!(Arc::strong_count(&b), 1);
-
-        let ctx_a = MostRecentSpillContext::new("independent-a".into());
-        let ctx_b = MostRecentSpillContext::new("independent-b".into());
-        ctx_a.set_attribution(TaskAttributionHandle::new(a.clone()));
-        ctx_b.set_attribution(TaskAttributionHandle::new(b.clone()));
-        polars_async::executor::track_task_metrics(true);
-        polars_core::runtime::ASYNC.block_in_place_on(async {
-            polars_async::executor::spawn(TaskPriority::High, ctx_a.0.attribution(), async {})
-                .await;
-            polars_async::executor::spawn(TaskPriority::High, ctx_b.0.attribution(), async {})
-                .await;
-        });
-        polars_async::executor::track_task_metrics(false);
-        assert_eq!(a.0.load(Ordering::Relaxed), 1);
-        assert_eq!(b.0.load(Ordering::Relaxed), 1);
     }
 }

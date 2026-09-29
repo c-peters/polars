@@ -50,9 +50,6 @@ impl ComputeNode for MultiplexerNode {
         // is no longer interested as closed.
         self.buffers.resize_with(send.len(), BufferedStream::new);
         for (s, b) in send.iter().zip(&mut self.buffers) {
-            if let BufferedStream::Open(_, ctx) = b {
-                ctx.set_attribution(_state.attribution.clone());
-            }
             if *s == PortState::Done {
                 *b = BufferedStream::Closed;
             }
