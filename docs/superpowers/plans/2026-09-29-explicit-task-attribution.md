@@ -1,6 +1,6 @@
 # Explicit Task Attribution Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace thread-local task attribution with explicit ownership at every computational spawn while preserving metrics and query behavior.
 
@@ -61,7 +61,7 @@
 
 - [x] Review spec compliance and code quality against the full diff, with particular attention to every empty owner and helpers that spawn only under size thresholds.
 - [x] Address any important findings with a reproducing test and run affected tests; retain exact failures and outcomes in the ledger.
-- [ ] Verify the changed branch is clean, record commit IDs, and report the plan path, branch, tests and any remaining limitations. Leave the requested branch available locally.
+- [x] Verify the changed branch is clean, record commit IDs, and report the plan path, branch, tests and any remaining limitations. Leave the requested branch available locally.
 
 ## Validation and review record
 
@@ -71,4 +71,6 @@
 - Behavioral mutation checks caught missing executor registration and missing graph ownership. Executor coverage includes overlapping owners, yields, Tokio handoff, scoped cancellation and inline/spawned helpers; the observer test covers real Parquet scan and aggregation.
 - Independent task review found a cross-join path that bypassed context binding. The subsequent explicit user decision to leave all spill/prefetch tasks unattributed superseded that binding requirement. Scoped re-review approved the removal and found no new breakage.
 - No performance benchmark or full workspace suite was run. Spill/prefetch work is deliberately omitted from query/node metrics.
-- Whole-branch review and final branch cleanliness check pending.
+- Whole-branch review of `adb73c51e5..bd939b1a4e`: spec and quality passed, no Critical or Important findings. Source worktree was clean; final documentation is committed separately and pushed to the same branch.
+- Nonblocking follow-up: the observer regression cannot distinguish nested decode/finalization registrations from parent or pipe polls. A focused recording-owner reader/helper regression would strengthen coverage; current propagation was reviewed in source.
+- Both task review and final review excluded newly measuring Tokio/Rayon, intentionally unowned OOC work, existing dependency warning cleanup and unmeasured performance/full-workspace guarantees. These match the final scope and validation limits above.
