@@ -1,6 +1,6 @@
 # Explicit Task Attribution Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Replace thread-local task attribution with explicit ownership at every computational spawn while preserving metrics and query behavior.
 
@@ -14,19 +14,19 @@
 
 - Base adb73c51e5, branch refactor/explicit-task-attribution, worktree /tmp/polars-driver-phase-metrics.
 - No ambient attribution lookup or TLS-restoring future wrapper remains.
-- Every task registers once before scheduling, with separate TaskMetrics and the correct query/node owner.
-- No indiscriminate empty ownership at node-owned spawn sites; unrelated scheduler TLS remains.
+- Every attributed task registers once before scheduling, with separate TaskMetrics and the correct query/node owner.
+- No indiscriminate empty ownership at node-owned spawn sites; background OOC spill/prefetch tasks are explicitly unattributed per the revised spec. Unrelated scheduler TLS remains.
 - Preserve priorities, lifetimes, cancellation, results, occupancy, and disabled-monitoring behavior.
 - No graph-specific dependency in polars-async; no graph locking per poll; no new measurement of Tokio work.
 - Run builds with CARGO_TARGET_DIR=/tmp/polars-explicit-attribution-target and keep test logs under /tmp.
-- Do not push or publish. Stage only this task's files.
+- Push this branch to c-peters as subsequently requested by the user. Do not open a PR or publish elsewhere. Stage only this task's files.
 
 ## Review Focus
 
 - Nested tasks spawned after a parent yields, including a Tokio handoff, retain their explicit owner.
 - Concurrent queries cannot attribute work to each other, even on the same worker.
 - Inline helper futures are not double counted; cancelled and scoped tasks retain existing cleanup semantics.
-- Work started during node update_state and pipeline setup has an owner, including optional reader/writer and spill paths.
+- Work started during node update_state and pipeline setup has an owner, including optional reader/writer paths. Background OOC spill/prefetch tasks are explicitly unattributed.
 - Disabled metrics and explicitly ownerless tasks do not accidentally register with a nearby node.
 
 ---
@@ -45,13 +45,13 @@
 - Produces: cloneable optional attribution handle; spawn(priority, attribution, future); TaskScope::spawn_task(priority, attribution, future); attribution-aware LocalOrSpawnedFuture and parallelize_first_to_local; StreamingExecutionState.attribution.
 - Graph/node attribution construction returns a handle, replacing the ambient guard. Any context additions must be carried through each constructor and helper call.
 
-- [ ] Add executor behavioral tests first. Prove exact registration counts for a parent with explicitly assigned and unassigned children, distinct query/node owners, scoped tasks, and inline/spawned helpers. Exercise a yield and a Tokio handoff. Use distinct recorded metric Arcs to detect duplicate registration. Serialize tests that toggle global tracking.
-- [ ] Run the tests against the old API and record the expected failure; where an API does not exist yet, document the compile failure and demonstrate behavioral failures during migration rather than claiming those errors alone prove behavior.
-- [ ] Introduce explicit attribution in both spawn APIs; retain per-task ownership and registration-before-schedule. Remove attribution TLS, guard and restoring wrapper, preserving worker timing TLS and occupancy polling.
-- [ ] Construct owner-specific execution state at graph update/spawn boundaries; preserve scoped borrow lifetimes. Explicitly attribute pipe tasks to the receiver. Propagate handles through all direct and helper spawns, source/sink initialization and nested helpers. Review every explicit empty owner against the call chain.
-- [ ] Run cargo test --offline -p polars-async --lib; expect all tests pass. Run cargo test --offline -p polars-lazy --features test,streaming --no-default-features --lib; expect all tests pass.
-- [ ] Run cargo check --offline -p polars-stream --all-features, or the supported feature matrix if mutually incompatible features prevent that combination. Include parquet,csv,ipc,json,scan_lines,python,object,dtype-categorical and joins/aggregation optional paths. Record actual commands and any pre-existing build limitations.
-- [ ] Format touched Rust files and run git diff --check. Audit the spawn inventory and removed ambient symbols. Self-review ownership/cancellation and commit the coherent migration.
+- [x] Add executor behavioral tests first. Prove exact registration counts for a parent with explicitly assigned and unassigned children, distinct query/node owners, scoped tasks, and inline/spawned helpers. Exercise a yield and a Tokio handoff. Use distinct recorded metric Arcs to detect duplicate registration. Serialize tests that toggle global tracking.
+- [x] Run the tests against the old API and record the expected failure; where an API does not exist yet, document the compile failure and demonstrate behavioral failures during migration rather than claiming those errors alone prove behavior.
+- [x] Introduce explicit attribution in both spawn APIs; retain per-task ownership and registration-before-schedule. Remove attribution TLS, guard and restoring wrapper, preserving worker timing TLS and occupancy polling.
+- [x] Construct owner-specific execution state at graph update/spawn boundaries; preserve scoped borrow lifetimes. Explicitly attribute pipe tasks to the receiver. Propagate handles through all direct and helper spawns, source/sink initialization and nested helpers. Review every explicit empty owner against the call chain.
+- [x] Run cargo test --offline -p polars-async --lib; expect all tests pass. Run cargo test --offline -p polars-lazy --features test,streaming --no-default-features --lib; expect all tests pass.
+- [x] Run cargo check --offline -p polars-stream --all-features, or the supported feature matrix if mutually incompatible features prevent that combination. Include parquet,csv,ipc,json,scan_lines,python,object,dtype-categorical and joins/aggregation optional paths. Record actual commands and any pre-existing build limitations.
+- [x] Format touched Rust files and run git diff --check. Audit the spawn inventory and removed ambient symbols. Self-review ownership/cancellation and commit the coherent migration.
 
 ### Task 2: Independent review and final verification
 
@@ -59,6 +59,16 @@
 
 **Interfaces:** Consumes explicit ownership APIs and test evidence from Task 1. Produces a verified branch and a concise handoff.
 
-- [ ] Review spec compliance and code quality against the full diff, with particular attention to every empty owner and helpers that spawn only under size thresholds.
-- [ ] Address any important findings with a reproducing test and run affected tests; retain exact failures and outcomes in the ledger.
+- [x] Review spec compliance and code quality against the full diff, with particular attention to every empty owner and helpers that spawn only under size thresholds.
+- [x] Address any important findings with a reproducing test and run affected tests; retain exact failures and outcomes in the ledger.
 - [ ] Verify the changed branch is clean, record commit IDs, and report the plan path, branch, tests and any remaining limitations. Leave the requested branch available locally.
+
+## Validation and review record
+
+- Implementation: `e4ea4198a2`; executor and observer test follow-up: `766276b97b`.
+- User-requested removal of spill-context attribution: `e5e49af8b5`. Background spill/prefetch spawns explicitly have no owner; all other node/task propagation remains.
+- Final revised-scope checks: `cargo test --offline -p polars-async --lib` (1 passed); `cargo test --offline -p polars-lazy --features test,streaming --no-default-features --lib` (150 passed); `cargo check --offline -p polars-stream --all-features` (passed). Commands used the target directory above. Existing dependency warnings remain.
+- Behavioral mutation checks caught missing executor registration and missing graph ownership. Executor coverage includes overlapping owners, yields, Tokio handoff, scoped cancellation and inline/spawned helpers; the observer test covers real Parquet scan and aggregation.
+- Independent task review found a cross-join path that bypassed context binding. The subsequent explicit user decision to leave all spill/prefetch tasks unattributed superseded that binding requirement. Scoped re-review approved the removal and found no new breakage.
+- No performance benchmark or full workspace suite was run. Spill/prefetch work is deliberately omitted from query/node metrics.
+- Whole-branch review and final branch cleanliness check pending.
