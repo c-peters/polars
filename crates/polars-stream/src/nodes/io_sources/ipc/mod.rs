@@ -482,27 +482,31 @@ impl FileReader for IpcFileReader {
                 let metrics = task_metrics.as_deref();
                 let mut next_row_offset: IdxSize = 0;
 
-                while let Some((prefetch_task, permit)) = prefetch_recv.recv().await {
-                    let mut record_batch_data = prefetch_task.await.unwrap()?;
+                'fetches: while let Some((prefetch_task, permit)) = prefetch_recv.recv().await {
+                    // The record batches of one fetch share its budget permit.
+                    let permit = permit.map(Arc::new);
 
-                    // Known up front, else counted in arrival order.
-                    let row_offset = *record_batch_data.row_offset.get_or_insert(next_row_offset);
-                    next_row_offset = row_offset
-                        .checked_add(record_batch_data.num_rows)
-                        .ok_or(ROW_COUNT_OVERFLOW_ERR)?;
+                    for mut record_batch_data in prefetch_task.await.unwrap()? {
+                        // Known up front, else counted in arrival order.
+                        let row_offset =
+                            *record_batch_data.row_offset.get_or_insert(next_row_offset);
+                        next_row_offset = row_offset
+                            .checked_add(record_batch_data.num_rows)
+                            .ok_or(ROW_COUNT_OVERFLOW_ERR)?;
 
-                    let record_batch_decoder = record_batch_decoder.clone();
-                    let decode_fut = executor::spawn(TaskPriority::High, metrics, async move {
-                        record_batch_decoder
-                            .record_batch_data_to_df(record_batch_data)
+                        let record_batch_decoder = record_batch_decoder.clone();
+                        let decode_fut = executor::spawn(TaskPriority::High, metrics, async move {
+                            record_batch_decoder
+                                .record_batch_data_to_df(record_batch_data)
+                                .await
+                        });
+                        if decode_send
+                            .send((Either::Left(decode_fut), permit.clone()))
                             .await
-                    });
-                    if decode_send
-                        .send((Either::Left(decode_fut), permit))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                            .is_err()
+                        {
+                            break 'fetches;
+                        }
                     }
                 }
 
@@ -530,7 +534,7 @@ impl FileReader for IpcFileReader {
                 let mut decode_handles = FuturesUnordered::new();
 
                 loop {
-                    let (record_batch_data, permit) = tokio::select! {
+                    let (fetched, permit) = tokio::select! {
                         biased;
 
                         // Distributor is gone; dropping the handles cancels running decodes.
@@ -541,38 +545,43 @@ impl FileReader for IpcFileReader {
                             None => break,
                         },
                     };
-                    let mut record_batch_data = record_batch_data?;
+                    // The record batches of one fetch share its budget permit.
+                    let permit = permit.map(Arc::new);
 
-                    // Known up front, else counted in arrival order.
-                    let row_offset = *record_batch_data.row_offset.get_or_insert(next_row_offset);
-                    next_row_offset = row_offset
-                        .checked_add(record_batch_data.num_rows)
-                        .ok_or(ROW_COUNT_OVERFLOW_ERR)?;
+                    for mut record_batch_data in fetched? {
+                        // Known up front, else counted in arrival order.
+                        let row_offset =
+                            *record_batch_data.row_offset.get_or_insert(next_row_offset);
+                        next_row_offset = row_offset
+                            .checked_add(record_batch_data.num_rows)
+                            .ok_or(ROW_COUNT_OVERFLOW_ERR)?;
 
-                    // Backpressure: blocks the fetch drain until a slot frees.
-                    let slot = decode_slots.clone().acquire_owned().await.unwrap();
+                        // Backpressure: blocks the fetch drain until a slot frees.
+                        let slot = decode_slots.clone().acquire_owned().await.unwrap();
 
-                    // Keep the set bounded; panics surface on drain.
-                    while let Some(Some(())) = decode_handles.next().now_or_never() {}
+                        // Keep the set bounded; panics surface on drain.
+                        while let Some(Some(())) = decode_handles.next().now_or_never() {}
 
-                    let record_batch_decoder = record_batch_decoder.clone();
-                    let decode_send = decode_send.clone();
+                        let record_batch_decoder = record_batch_decoder.clone();
+                        let decode_send = decode_send.clone();
+                        let permit = permit.clone();
 
-                    decode_handles.push(executor::AbortOnDropHandle::new(executor::spawn(
-                        TaskPriority::High,
-                        metrics,
-                        async move {
-                            let df = record_batch_decoder
-                                .record_batch_data_to_df(record_batch_data)
-                                .await;
+                        decode_handles.push(executor::AbortOnDropHandle::new(executor::spawn(
+                            TaskPriority::High,
+                            metrics,
+                            async move {
+                                let df = record_batch_decoder
+                                    .record_batch_data_to_df(record_batch_data)
+                                    .await;
 
-                            if !matches!(&df, Ok(df) if df.height() == 0) {
-                                let fut = Either::Right(std::future::ready(df));
-                                let _ = decode_send.send((fut, permit)).await;
-                            }
-                            drop(slot);
-                        },
-                    )));
+                                if !matches!(&df, Ok(df) if df.height() == 0) {
+                                    let fut = Either::Right(std::future::ready(df));
+                                    let _ = decode_send.send((fut, permit)).await;
+                                }
+                                drop(slot);
+                            },
+                        )));
+                    }
                 }
 
                 drop(decode_send);
