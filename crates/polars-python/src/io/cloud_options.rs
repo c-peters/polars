@@ -146,10 +146,11 @@ impl OptPyCloudOptions<'_> {
             .with_rate_limit_config(rate_limit_config);
 
         #[cfg(feature = "cloud")]
-        let mut cloud_options =
-            cloud_options.with_credential_provider(credential_provider.map(
-                polars_io::cloud::credential_provider::PlCredentialProvider::from_python_builder,
-            ));
+        let mut cloud_options = cloud_options.with_credential_provider(
+            credential_provider
+                .map(polars_io::cloud::credential_provider::PlCredentialProvider::from_python_builder)
+                .transpose()?,
+        );
 
         #[cfg(feature = "cloud")]
         if file_cache_ttl > 0 {

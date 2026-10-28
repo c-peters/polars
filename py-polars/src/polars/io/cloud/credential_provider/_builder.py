@@ -4,7 +4,7 @@ import abc
 import os
 import threading
 from copy import copy
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal
 
 import polars._utils.logging
 from polars._utils.cache import LRUCache
@@ -96,29 +96,19 @@ class CredentialProviderBuilder:
         """
         self.credential_provider_init = credential_provider_init
 
-    # Note: The rust-side expects this exact function name. Returns
-    # `(cloud, kwargs)` when this builder wraps an auto-initialization
-    # config, so Rust can carry it as plain data instead of a pickled object.
+    # Note: The rust-side expects these exact function names.
     def _rust_auto_descriptor(self) -> tuple[str, dict[str, Any]] | None:
         init = self.credential_provider_init
-        if not isinstance(init, AutoInit):
-            return None
-        from polars.io.cloud.credential_provider._providers import (
-            CredentialProviderAWS,
-            CredentialProviderAzure,
-            CredentialProviderGCP,
-        )
+        return (init.cloud, init.kw) if isinstance(init, AutoInit) else None
 
-        cloud = {
-            CredentialProviderAWS: "aws",
-            CredentialProviderAzure: "azure",
-            CredentialProviderGCP: "gcp",
-        }.get(init.cls)
-        if cloud is None:
-            return None
-        return cloud, init.kw
+    @classmethod
+    def _from_auto(
+        cls, cloud: str, cache_key: bytes, **kw: Any
+    ) -> CredentialProviderBuilder:
+        init = AutoInit(cloud, **kw)
+        init._cache_key.set(cache_key)
+        return cls(init)
 
-    # Note: The rust-side expects this exact function name.
     def build_credential_provider(
         self,
         clear_cached_credentials: bool = False,  # noqa: FBT001
@@ -314,8 +304,15 @@ def _build_with_cache(
 # Represents an automatic initialization configuration. This is created for
 # credential_provider="auto".
 class AutoInit(CredentialProviderBuilderImpl):
-    def __init__(self, cls: Any, **kw: Any) -> None:
-        self.cls = cls
+    _PROVIDERS: ClassVar[dict[str, type[CredentialProvider]]] = {
+        "aws": CredentialProviderAWS,
+        "azure": CredentialProviderAzure,
+        "gcp": CredentialProviderGCP,
+    }
+
+    def __init__(self, cloud: str, **kw: Any) -> None:
+        self.cloud = cloud
+        self.cls = self._PROVIDERS[cloud]
         self.kw = kw
         self._cache_key: NoPickleOption[bytes] = NoPickleOption()
 
@@ -483,7 +480,7 @@ def _init_credential_provider_builder(
 
             return CredentialProviderBuilder(
                 AutoInit(
-                    CredentialProviderAzure,
+                    "azure",
                     tenant_id=tenant_id,
                     _storage_account=storage_account,
                 )
@@ -532,7 +529,7 @@ def _init_credential_provider_builder(
 
             return CredentialProviderBuilder(
                 AutoInit(
-                    CredentialProviderAWS,
+                    "aws",
                     profile_name=profile,
                     region_name=region or default_region,
                     _auto_init_unhandled_key=unhandled_key,
@@ -576,7 +573,7 @@ def _init_credential_provider_builder(
             if (default := get_default_credential_provider()) is not None:
                 return default
 
-            return CredentialProviderBuilder(AutoInit(CredentialProviderGCP))
+            return CredentialProviderBuilder(AutoInit("gcp"))
 
         return None
 

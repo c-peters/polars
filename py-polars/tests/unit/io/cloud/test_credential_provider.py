@@ -916,7 +916,7 @@ def test_auto_init_cache_key_memoize(plmonkeypatch: PlMonkeyPatch) -> None:
         lambda *a, **kw: get_cache_key_impl(*a, **kw),
     )
 
-    v = AutoInit(int)
+    v = AutoInit("aws")
 
     assert get_cache_key_impl.call_count == 0
 
