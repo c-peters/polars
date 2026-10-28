@@ -96,6 +96,28 @@ class CredentialProviderBuilder:
         """
         self.credential_provider_init = credential_provider_init
 
+    # Note: The rust-side expects this exact function name. Returns
+    # `(cloud, kwargs)` when this builder wraps an auto-initialization
+    # config, so Rust can carry it as plain data instead of a pickled object.
+    def _rust_auto_descriptor(self) -> tuple[str, dict[str, Any]] | None:
+        init = self.credential_provider_init
+        if not isinstance(init, AutoInit):
+            return None
+        from polars.io.cloud.credential_provider._providers import (
+            CredentialProviderAWS,
+            CredentialProviderAzure,
+            CredentialProviderGCP,
+        )
+
+        cloud = {
+            CredentialProviderAWS: "aws",
+            CredentialProviderAzure: "azure",
+            CredentialProviderGCP: "gcp",
+        }.get(init.cls)
+        if cloud is None:
+            return None
+        return cloud, init.kw
+
     # Note: The rust-side expects this exact function name.
     def build_credential_provider(
         self,

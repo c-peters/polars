@@ -26,6 +26,29 @@ pub enum PlCredentialProvider {
     Function(CredentialProviderFunction),
     #[cfg(feature = "python")]
     Python(PythonCredentialProvider),
+    /// Describes a credential provider that is auto-initialized on the executing side. This is
+    /// plain data: it carries no code and can be serialized without pickling.
+    Auto(AutoCredentialProvider),
+}
+
+/// Configuration for `credential_provider="auto"`. The scan path scheme and `storage_options`
+/// are resolved into this descriptor at query construction, and the matching provider is
+/// instantiated where the query executes.
+#[derive(Clone, Debug, PartialEq, Hash, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "dsl-schema", derive(schemars::JsonSchema))]
+pub enum AutoCredentialProvider {
+    Aws {
+        profile_name: Option<PlSmallStr>,
+        region_name: Option<PlSmallStr>,
+        unhandled_key: Option<PlSmallStr>,
+        storage_options: Vec<(PlSmallStr, Option<PlSmallStr>)>,
+    },
+    Azure {
+        tenant_id: Option<PlSmallStr>,
+        storage_account: Option<PlSmallStr>,
+    },
+    Gcp,
 }
 
 impl PlCredentialProvider {
@@ -48,6 +71,9 @@ impl PlCredentialProvider {
     /// py-polars.
     #[cfg(feature = "python")]
     pub fn from_python_builder(func: pyo3::Py<pyo3::PyAny>) -> Self {
+        if let Some(auto) = python_impl::extract_auto_descriptor(&func) {
+            return Self::Auto(auto);
+        }
         Self::Python(python_impl::PythonCredentialProvider::Builder(Arc::new(
             PythonObject(func),
         )))
@@ -59,6 +85,12 @@ impl PlCredentialProvider {
             Self::Function(CredentialProviderFunction(v)) => Arc::as_ptr(v) as *const () as usize,
             #[cfg(feature = "python")]
             Self::Python(v) => v.func_addr(),
+            Self::Auto(v) => {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::hash::DefaultHasher::new();
+                v.hash(&mut h);
+                h.finish() as usize
+            },
         }
     }
 
@@ -76,6 +108,11 @@ impl PlCredentialProvider {
             Self::Python(v) => Ok(v
                 .try_into_initialized(clear_cached_credentials)?
                 .map(Self::Python)),
+            #[cfg(feature = "python")]
+            Self::Auto(v) => Ok(PythonCredentialProvider::try_init_auto(&v, clear_cached_credentials)?
+                .map(Self::Python)),
+            #[cfg(not(feature = "python"))]
+            Self::Auto(_) => Ok(None),
         }
     }
 
@@ -87,6 +124,7 @@ impl PlCredentialProvider {
                 .to_vec()),
             #[cfg(feature = "python")]
             Self::Python(v) => v.stable_cache_key(),
+            Self::Auto(v) => Ok(format!("{v:?}").into_bytes()),
         }
     }
 }
@@ -179,6 +217,7 @@ impl IntoCredentialProvider for PlCredentialProvider {
             Self::Function(v) => v.into_aws_provider(),
             #[cfg(feature = "python")]
             Self::Python(v) => v.into_aws_provider(),
+            Self::Auto(_) => panic!("auto credential provider must be initialized first"),
         }
     }
 
@@ -188,6 +227,7 @@ impl IntoCredentialProvider for PlCredentialProvider {
             Self::Function(v) => v.into_azure_provider(),
             #[cfg(feature = "python")]
             Self::Python(v) => v.into_azure_provider(),
+            Self::Auto(_) => panic!("auto credential provider must be initialized first"),
         }
     }
 
@@ -197,6 +237,7 @@ impl IntoCredentialProvider for PlCredentialProvider {
             Self::Function(v) => v.into_gcp_provider(),
             #[cfg(feature = "python")]
             Self::Python(v) => v.into_gcp_provider(),
+            Self::Auto(_) => panic!("auto credential provider must be initialized first"),
         }
     }
 
@@ -205,6 +246,7 @@ impl IntoCredentialProvider for PlCredentialProvider {
             Self::Function(v) => v.storage_update_options(),
             #[cfg(feature = "python")]
             Self::Python(v) => v.storage_update_options(),
+            Self::Auto(_) => Ok(vec![]),
         }
     }
 }
@@ -358,40 +400,46 @@ impl Hash for CredentialProviderFunction {
     }
 }
 
+/// Wire representation of [`PlCredentialProvider`]. Rust functions cannot be serialized.
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize, serde::Deserialize)]
+enum PlCredentialProviderSerde {
+    #[cfg(feature = "python")]
+    Python(PythonCredentialProvider),
+    Auto(AutoCredentialProvider),
+}
+
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for PlCredentialProvider {
-    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        #[cfg(feature = "python")]
-        {
-            Ok(Self::Python(PythonCredentialProvider::deserialize(
-                _deserializer,
-            )?))
-        }
-        #[cfg(not(feature = "python"))]
-        {
-            use serde::de::Error;
-            Err(D::Error::custom("cannot deserialize PlCredentialProvider"))
-        }
+        Ok(match PlCredentialProviderSerde::deserialize(deserializer)? {
+            #[cfg(feature = "python")]
+            PlCredentialProviderSerde::Python(v) => Self::Python(v),
+            PlCredentialProviderSerde::Auto(v) => Self::Auto(v),
+        })
     }
 }
 
 #[cfg(feature = "serde")]
 impl serde::Serialize for PlCredentialProvider {
-    fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         use serde::ser::Error;
 
-        #[cfg(feature = "python")]
-        if let PlCredentialProvider::Python(v) = self {
-            return v.serialize(_serializer);
-        }
-
-        Err(S::Error::custom(format!("cannot serialize {self:?}")))
+        let repr = match self {
+            #[cfg(feature = "python")]
+            Self::Python(v) => PlCredentialProviderSerde::Python(v.clone()),
+            Self::Auto(v) => PlCredentialProviderSerde::Auto(v.clone()),
+            Self::Function(_) => {
+                return Err(S::Error::custom(format!("cannot serialize {self:?}")));
+            },
+        };
+        repr.serialize(serializer)
     }
 }
 
@@ -543,12 +591,118 @@ mod python_impl {
         Provider(Arc<PythonObject>),
     }
 
+    /// Reads the `_rust_auto_descriptor()` of a `CredentialProviderBuilder`, if it wraps an
+    /// auto-initialization config.
+    pub(super) fn extract_auto_descriptor(
+        builder: &pyo3::Py<pyo3::PyAny>,
+    ) -> Option<super::AutoCredentialProvider> {
+        use super::AutoCredentialProvider as A;
+        Python::attach(|py| {
+            let v = builder
+                .call_method0(py, intern!(py, "_rust_auto_descriptor"))
+                .ok()?;
+            if v.is_none(py) {
+                return None;
+            }
+            let (cloud, kw) = v
+                .extract::<(PyBackedStr, pyo3::Bound<'_, PyDict>)>(py)
+                .ok()?;
+            let get = |k: &str| -> Option<PlSmallStr> {
+                kw.get_item(k)
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.extract::<Option<PyBackedStr>>().ok().flatten())
+                    .map(|s| PlSmallStr::from(&*s))
+            };
+            Some(match &*cloud {
+                "aws" => {
+                    let storage_options = kw
+                        .get_item("_storage_options")
+                        .ok()
+                        .flatten()
+                        .and_then(|so| so.extract::<Option<pyo3::Bound<'_, PyDict>>>().ok().flatten())
+                        .map(|so| {
+                            so.iter()
+                                .filter_map(|(k, v)| {
+                                    let k = k.extract::<PyBackedStr>().ok()?;
+                                    let v = v.extract::<Option<PyBackedStr>>().ok()?;
+                                    Some((PlSmallStr::from(&*k), v.map(|v| PlSmallStr::from(&*v))))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    A::Aws {
+                        profile_name: get("profile_name"),
+                        region_name: get("region_name"),
+                        unhandled_key: get("_auto_init_unhandled_key"),
+                        storage_options,
+                    }
+                },
+                "azure" => A::Azure {
+                    tenant_id: get("tenant_id"),
+                    storage_account: get("_storage_account"),
+                },
+                "gcp" => A::Gcp,
+                _ => return None,
+            })
+        })
+    }
+
     impl PythonCredentialProvider {
         /// Performs initialization if necessary.
         ///
         /// This exists as a separate step that must be called beforehand. This approach is easier
         /// as the alternative is to refactor the `IntoCredentialProvider` trait to return
         /// `PolarsResult<Option<T>>` for every single function.
+        /// Instantiates the Python provider described by `auto`. Returns `None` when the
+        /// provider's dependencies are not importable, which falls back to the Rust resolver.
+        pub(super) fn try_init_auto(
+            auto: &super::AutoCredentialProvider,
+            clear_cached_credentials: bool,
+        ) -> PolarsResult<Option<Self>> {
+            use super::AutoCredentialProvider as A;
+            let builder = Python::attach(|py| -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
+                let m = py.import(intern!(py, "polars.io.cloud.credential_provider._builder"))?;
+                let kw = PyDict::new(py);
+                let cls = match auto {
+                    A::Aws {
+                        profile_name,
+                        region_name,
+                        unhandled_key,
+                        storage_options,
+                    } => {
+                        kw.set_item("profile_name", profile_name.as_deref())?;
+                        kw.set_item("region_name", region_name.as_deref())?;
+                        kw.set_item("_auto_init_unhandled_key", unhandled_key.as_deref())?;
+                        let so = PyDict::new(py);
+                        for (k, v) in storage_options {
+                            so.set_item(k.as_str(), v.as_deref())?;
+                        }
+                        kw.set_item("_storage_options", so)?;
+                        "CredentialProviderAWS"
+                    },
+                    A::Azure {
+                        tenant_id,
+                        storage_account,
+                    } => {
+                        kw.set_item("tenant_id", tenant_id.as_deref())?;
+                        kw.set_item("_storage_account", storage_account.as_deref())?;
+                        "CredentialProviderAzure"
+                    },
+                    A::Gcp => "CredentialProviderGCP",
+                };
+                let cls = m.getattr(cls)?;
+                let auto_init = m.getattr(intern!(py, "AutoInit"))?.call((cls,), Some(&kw))?;
+                let builder = m
+                    .getattr(intern!(py, "CredentialProviderBuilder"))?
+                    .call1((auto_init,))?;
+                Ok(builder.unbind())
+            })?;
+
+            Self::Builder(Arc::new(PythonObject(builder)))
+                .try_into_initialized(clear_cached_credentials)
+        }
+
         pub(super) fn try_into_initialized(
             self,
             clear_cached_credentials: bool,
