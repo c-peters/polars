@@ -24,6 +24,9 @@ if TYPE_CHECKING:
     import polars.io.iceberg
     from polars._typing import StorageOptionsDict
     from polars.expr.expr import Expr
+    from polars.io.cloud.credential_provider._providers import (
+        CredentialProviderFunction,
+    )
     from polars.io.iceberg._time_travel import TableVersion
     from polars.lazyframe.frame import LazyFrame
 
@@ -309,6 +312,8 @@ def _scan_iceberg_files(
     table: pyiceberg.table.Table,
     tasks: list[pyiceberg.table.FileScanTask],
     storage_options: StorageOptionsDict | None,
+    *,
+    catalog_credential_provider: CredentialProviderFunction | None = None,
 ) -> LazyFrame:
     """Scan every row of exactly the files of `tasks`, planned on `table`.
 
@@ -322,6 +327,7 @@ def _scan_iceberg_files(
             table_descriptor_=None,
             serializer=IcebergScanTableSerializer(),
             iceberg_storage_properties=storage_options,
+            catalog_credential_provider_=NoPickleOption(catalog_credential_provider),
         ),
         snapshot_id=None,
         from_snapshot_id_exclusive=None,

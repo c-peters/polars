@@ -13,6 +13,8 @@ from polars.io.cloud._utils import NoPickleOption
 from polars.io.cloud.credential_provider._builder import (
     CredentialProviderBuilder,
     InitializedCredentialProvider,
+    _aws_storage_options,
+    _bind_aws_storage_options,
 )
 from polars.io.cloud.credential_provider._providers import CachingCredentialProvider
 from polars.io.iceberg._cache import _credential_env_fingerprint
@@ -22,6 +24,7 @@ from polars.io.iceberg._dataset import (
     _reusable_catalog,
 )
 from polars.io.iceberg._plugin import (
+    _CATALOG_CREDENTIAL_KEYS,
     _PROPERTY_SCHEMES,
     _catalog_storage_options,
     _is_credential_key,
@@ -36,6 +39,7 @@ if TYPE_CHECKING:
     import pyiceberg.table
 
     from polars.io.cloud.credential_provider._providers import (
+        CredentialProviderFunction,
         CredentialProviderFunctionReturn,
     )
 
@@ -72,6 +76,7 @@ def renewing_credential_provider(
     location: str,
     *,
     catalog_name: str | None = None,
+    catalog_credential_provider: CredentialProviderFunction | None = None,
 ) -> tuple[dict[str, Any], CredentialProviderBuilder | Literal["auto"]]:
     """
     Move the vended credentials that the catalog can renew out of `storage_options`.
@@ -84,9 +89,26 @@ def renewing_credential_provider(
 
     `catalog_name` is the catalog's name if `tbl` was loaded by it: renewals then
     resolve the name too, rather than carry the catalog's properties.
+
+    `catalog_credential_provider` is the one the catalog resolver gave with `tbl`.
+    Unless the user gives credentials, it replaces the catalog's credentials.
     """
-    if not storage_options or _has_credentials(user_storage_options):
+    if _has_credentials(user_storage_options):
         return storage_options or {}, "auto"
+    if catalog_credential_provider is not None:
+        storage_options = {
+            k: v
+            for k, v in (storage_options or {}).items()
+            if k not in _CATALOG_CREDENTIAL_KEYS
+        }
+        provider = _bind_aws_storage_options(
+            catalog_credential_provider, _aws_storage_options(storage_options)
+        )
+        return storage_options, CredentialProviderBuilder.from_initialized_provider(
+            provider
+        )
+    if not storage_options:
+        return {}, "auto"
     keys = _renewable_keys(tbl, storage_options, location)
     if not keys:
         return storage_options, "auto"

@@ -42,6 +42,9 @@ if TYPE_CHECKING:
 
     from polars import LazyFrame
     from polars._typing import StorageOptionsDict
+    from polars.io.cloud.credential_provider._providers import (
+        CredentialProviderFunction,
+    )
 
 # Python distribution name of the plugin, as used with pip.
 PLUGIN_PACKAGE_NAME = "polars_iceberg"
@@ -130,6 +133,7 @@ def plugin_scan(
     fast_deletion_count: bool,
     user_storage_options: StorageOptionsDict | None,
     catalog_name: str | None = None,
+    catalog_credential_provider: CredentialProviderFunction | None = None,
 ) -> LazyFrame:
     """Plan the scan of `tbl` with the plugin; returns the native parquet scan."""
     from polars.io.iceberg._credentials import renewing_credential_provider
@@ -162,6 +166,7 @@ def plugin_scan(
         user_storage_options,
         _table_location(tbl),
         catalog_name=catalog_name,
+        catalog_credential_provider=catalog_credential_provider,
     )
     credential_provider = _init_credential_provider_builder(
         renewing_provider, metadata_location, storage_options, "scan_iceberg"
@@ -171,7 +176,7 @@ def plugin_scan(
     # configuration, as with the PyIceberg planner.
     metadata_cache = get_metadata_file_cache()
     metadata_cache_scope = (
-        plugin_storage_scope(tbl.io, user_storage_options)
+        plugin_storage_scope(tbl.io, user_storage_options, catalog_credential_provider)
         if metadata_cache.enabled
         else None
     )

@@ -449,6 +449,32 @@ _GCP_CLIENT_KEYS: Final[frozenset[str]] = AUTOINIT_IGNORED_KEYS | {
 }
 
 
+def _aws_storage_options(
+    storage_options: StorageOptionsDict | None,
+) -> dict[str, str | None]:
+    aws_storage_options: dict[str, str | None] = {}
+    for key, value in (storage_options or {}).items():
+        key = key.lower().removeprefix("aws_")
+        if key in {"region", "default_region", "virtual_hosted_style_request"}:
+            aws_storage_options[key] = value
+        elif key in {"endpoint", "endpoint_url", "endpoint_url_s3"}:
+            aws_storage_options["endpoint"] = None
+    return aws_storage_options
+
+
+def _bind_aws_storage_options(
+    provider: CredentialProviderFunction,
+    aws_storage_options: dict[str, str | None],
+) -> CredentialProviderFunction:
+    """`provider`, configured with the AWS region and endpoint storage options."""
+    if not aws_storage_options or not isinstance(provider, CredentialProviderAWS):
+        return provider
+
+    provider = copy(provider)
+    provider._storage_options = aws_storage_options
+    return provider
+
+
 def _init_credential_provider_builder(
     credential_provider: CredentialProviderFunction
     | CredentialProviderBuilder
@@ -458,23 +484,12 @@ def _init_credential_provider_builder(
     storage_options: StorageOptionsDict | None,
     caller_name: str,
 ) -> CredentialProviderBuilder | None:
-    aws_storage_options: dict[str, str | None] = {}
-    for key, value in (storage_options or {}).items():
-        key = key.lower().removeprefix("aws_")
-        if key in {"region", "default_region", "virtual_hosted_style_request"}:
-            aws_storage_options[key] = value
-        elif key in {"endpoint", "endpoint_url", "endpoint_url_s3"}:
-            aws_storage_options["endpoint"] = None
+    aws_storage_options = _aws_storage_options(storage_options)
 
     def bind_aws_storage_options(
         provider: CredentialProviderFunction,
     ) -> CredentialProviderFunction:
-        if not aws_storage_options or not isinstance(provider, CredentialProviderAWS):
-            return provider
-
-        provider = copy(provider)
-        provider._storage_options = aws_storage_options
-        return provider
+        return _bind_aws_storage_options(provider, aws_storage_options)
 
     def f() -> CredentialProviderBuilder | None:
         # Note: The behavior of this function should depend only on the function

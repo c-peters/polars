@@ -195,7 +195,10 @@ def _default_credential_provider_scope() -> str | None:
     # None when it cannot be identified.
     import polars.io.cloud.credential_provider._builder as builder
 
-    provider = builder.DEFAULT_CREDENTIAL_PROVIDER
+    return _credential_provider_scope(builder.DEFAULT_CREDENTIAL_PROVIDER)
+
+
+def _credential_provider_scope(provider: Any) -> str | None:
     if provider is None or isinstance(provider, str):
         return repr(provider)
     try:
@@ -210,17 +213,25 @@ def _default_credential_provider_scope() -> str | None:
 
 
 def plugin_storage_scope(
-    file_io: FileIO, storage_options: Mapping[str, Any] | None
+    file_io: FileIO,
+    storage_options: Mapping[str, Any] | None,
+    catalog_credential_provider: Any = None,
 ) -> str | None:
     """Cache scope of a scan planned by the plugin.
 
     The plugin reads with storage configured from the FileIO's properties, the
-    user's storage options and Polars' default credential provider, so all are
-    fingerprinted. None when one cannot be.
+    user's storage options and Polars' default credential provider, or the catalog
+    resolver's, so all are fingerprinted. None when one cannot be.
     """
     if (io_scope := _file_io_scope(file_io)) is None:
         return None
-    if (provider_scope := _default_credential_provider_scope()) is None:
+    if (
+        provider_scope := (
+            _credential_provider_scope(catalog_credential_provider)
+            if catalog_credential_provider is not None
+            else _default_credential_provider_scope()
+        )
+    ) is None:
         return None
     try:
         options_scope = _properties_fingerprint(storage_options or {})

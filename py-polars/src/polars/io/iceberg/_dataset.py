@@ -20,7 +20,11 @@ from polars.io.iceberg._cache import (
     get_metadata_file_cache,
     load_static_table,
 )
-from polars.io.iceberg._catalog_resolver import catalog_from
+from polars.io.iceberg._catalog_resolver import (
+    IcebergResolvedCatalog,
+    catalog_from,
+    resolve_catalog_with_credential_provider,
+)
 from polars.io.iceberg._plugin import (
     _data_location,
     _native_storage_options,
@@ -56,6 +60,9 @@ if TYPE_CHECKING:
     from polars.io.cloud._utils import NoPickleOption
     from polars.io.cloud.credential_provider._builder import (
         CredentialProviderBuilder,
+    )
+    from polars.io.cloud.credential_provider._providers import (
+        CredentialProviderFunction,
     )
     from polars.io.iceberg._time_travel import TableVersion
     from polars.lazyframe.frame import LazyFrame
@@ -98,6 +105,14 @@ class IcebergCatalogTableDescriptor:
         if not isinstance(self.catalog_config, str):
             self.catalog_ = NoPickleOption(_reusable_catalog(catalog))
         return catalog
+
+    def resolved_catalog(self) -> IcebergResolvedCatalog:
+        """As `catalog`, with the resolver's credential provider for a catalog name."""
+        if isinstance(self.catalog_config, str) and (
+            self.catalog_ is None or self.catalog_.get() is None
+        ):
+            return resolve_catalog_with_credential_provider(self.catalog_config)
+        return IcebergResolvedCatalog(self.catalog())
 
 
 # Catalog classes whose instances, and those of their subclasses, can load tables
@@ -164,6 +179,10 @@ class IcebergTableWrap:
     table_descriptor_: SerializedTableState | None
     serializer: IcebergTableSerializer
     iceberg_storage_properties: StorageOptionsDict | None
+    # For the data files, given by the catalog resolver with the loaded table.
+    catalog_credential_provider_: NoPickleOption[CredentialProviderFunction] | None = (
+        field(default=None, repr=False, compare=False)
+    )
     # Scans sharing the wrap resolve concurrently: they load the table once.
     _load_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False, compare=False
@@ -195,8 +214,12 @@ class IcebergTableWrap:
             assert self.table_descriptor_ is not None
 
             if isinstance(self.table_descriptor_, IcebergCatalogTableDescriptor):
-                table = _load_catalog_table(
-                    self.table_descriptor_.catalog(), self.table_descriptor_
+                from polars.io.cloud._utils import NoPickleOption
+
+                resolved = self.table_descriptor_.resolved_catalog()
+                table = _load_catalog_table(resolved.catalog, self.table_descriptor_)
+                self.catalog_credential_provider_ = NoPickleOption(
+                    resolved.credential_provider
                 )
             else:
                 table = _load_static_table(
@@ -206,6 +229,12 @@ class IcebergTableWrap:
             self.table_.set(table)
 
         return self.table_.get()  # type: ignore[return-value]
+
+    def catalog_credential_provider(self) -> CredentialProviderFunction | None:
+        """The catalog resolver's credential provider for the loaded table, if any."""
+        self.get()
+        provider = self.catalog_credential_provider_
+        return provider.get() if provider is not None else None
 
     def catalog_name(self) -> str | None:
         """The catalog's name, if the table is loaded from a catalog by name."""
@@ -606,6 +635,9 @@ class IcebergScanResolver:
                     fast_deletion_count=self.fast_deletion_count,
                     user_storage_options=self.table.iceberg_storage_properties,
                     catalog_name=self.table.catalog_name(),
+                    catalog_credential_provider=(
+                        self.table.catalog_credential_provider()
+                    ),
                 )
             except NotImplementedError as e:
                 # A table feature the plugin does not support (e.g. equality deletes),
@@ -948,6 +980,7 @@ class IcebergScanResolver:
                 self.table.iceberg_storage_properties,
                 _data_location(tbl),
                 catalog_name=self.table.catalog_name(),
+                catalog_credential_provider=self.table.catalog_credential_provider(),
             )
 
             return _NativeIcebergScanData(
