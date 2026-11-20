@@ -1584,6 +1584,66 @@ def test_iceberg_plugin_renews_vended_credentials(
     assert b"SqlCatalog" not in pickled
 
 
+def test_iceberg_plugin_uses_resolver_credential_provider(
+    tmp_path: Path, plmonkeypatch: PlMonkeyPatch
+) -> None:
+    from polars.io.cloud.credential_provider._builder import (
+        CredentialProviderBuilder,
+    )
+    from polars.io.iceberg import _catalog_resolver
+
+    tbl, catalog = new_iceberg_table(
+        tmp_path,
+        schema=IcebergSchema(NestedField(1, "a", LongType())),
+        catalog_properties={
+            "s3.region": "eu-west-1",
+            "s3.access-key-id": "vended-key",
+            "s3.secret-access-key": "vended-secret",
+        },
+    )
+    tbl.metadata_location = "s3://bucket/t/metadata/v1.metadata.json"
+    tbl.metadata = tbl.metadata.model_copy(update={"location": "s3://bucket/t"})
+    plmonkeypatch.setattr(catalog, "load_table", lambda identifier: tbl)
+
+    def role_credentials() -> tuple[dict[str, str], int | None]:
+        return {"aws_access_key_id": "role-key"}, None
+
+    plmonkeypatch.setattr(
+        _catalog_resolver,
+        "ICEBERG_CATALOG_RESOLVER",
+        lambda name: _catalog_resolver.IcebergResolvedCatalog(
+            catalog, credential_provider=role_credentials
+        ),
+    )
+
+    def capture(*args: Any, **kwargs: Any) -> Any:
+        raise _ScanArgs(kwargs)
+
+    plmonkeypatch.setattr(plr, "_iceberg_plugin_scan", capture)
+    with pytest.raises(_ScanArgs) as e:
+        pl.scan_iceberg("ns.t", catalog="sales").collect()
+    kwargs = e.value.args[0]
+
+    # The catalog's credentials are replaced by the resolver's provider.
+    assert kwargs["storage_options"] == {"aws_region": "eu-west-1"}
+    builder = kwargs["credential_provider"]
+    assert isinstance(builder, CredentialProviderBuilder)
+    assert builder.build_credential_provider()() == (  # type: ignore[misc]
+        {"aws_access_key_id": "role-key"},
+        None,
+    )
+
+    # Metadata cached with the catalog's credentials is not shared with it.
+    plmonkeypatch.setattr(
+        _catalog_resolver, "ICEBERG_CATALOG_RESOLVER", lambda name: catalog
+    )
+    with pytest.raises(_ScanArgs) as e:
+        pl.scan_iceberg("ns.t", catalog="sales").collect()
+    scope = e.value.args[0]["metadata_cache_scope"]
+    assert scope is not None
+    assert kwargs["metadata_cache_scope"] not in (None, scope)
+
+
 def test_iceberg_plugin_catalog_storage_options_by_scheme() -> None:
     from polars.io.iceberg._plugin import _catalog_storage_options
 

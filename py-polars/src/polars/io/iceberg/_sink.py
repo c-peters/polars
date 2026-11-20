@@ -13,7 +13,10 @@ from polars._utils.logging import eprint
 from polars._utils.wrap import wrap_ldf
 from polars.exceptions import ComputeError
 from polars.io.cloud._utils import NoPickleOption
-from polars.io.iceberg._catalog_resolver import check_catalog_name, resolve_catalog
+from polars.io.iceberg._catalog_resolver import (
+    check_catalog_name,
+    resolve_catalog_with_credential_provider,
+)
 from polars.io.iceberg._dataset import (
     IcebergCatalogConfig,
     _reusable_catalog,
@@ -62,6 +65,9 @@ if TYPE_CHECKING:
         ParquetCompression,
         PolarsDataType,
         StorageOptionsDict,
+    )
+    from polars.io.cloud.credential_provider._providers import (
+        CredentialProviderFunction,
     )
 
 
@@ -1315,6 +1321,10 @@ class IcebergSinkState:
     commit_result_df: NoPickleOption[pl.DataFrame]
     # Data files the commit replaces, instead of appending or overwriting.
     replace_files: _ReplaceFiles | _HandBack | None = None
+    # For the data files, given by the catalog resolver with the loaded table.
+    catalog_credential_provider_: NoPickleOption[CredentialProviderFunction] | None = (
+        None
+    )
 
     @staticmethod
     def new(
@@ -1461,7 +1471,13 @@ class IcebergSinkState:
 
                 if class_module is None and class_qualname is None:
                     # Only the catalog's name was kept: resolve it in this process.
-                    catalog = resolve_catalog(self.catalog_name)
+                    resolved = resolve_catalog_with_credential_provider(
+                        self.catalog_name
+                    )
+                    catalog = resolved.catalog
+                    self.catalog_credential_provider_ = NoPickleOption(
+                        resolved.credential_provider
+                    )
                 elif class_module is None or class_qualname is None:
                     msg = (
                         "invalid Iceberg sink state: the catalog class module and "
@@ -1487,6 +1503,12 @@ class IcebergSinkState:
             self.table_.set(self._load_or_create_table(catalog))
 
         return self.table_.get()  # type: ignore[return-value]
+
+    def _catalog_credential_provider(self) -> CredentialProviderFunction | None:
+        """The catalog resolver's credential provider for the loaded table, if any."""
+        self.table()
+        provider = self.catalog_credential_provider_
+        return provider.get() if provider is not None else None
 
     def _load_or_create_table(
         self, catalog: pyiceberg.catalog.Catalog
@@ -1703,6 +1725,7 @@ class IcebergSinkState:
             catalog_name=(
                 self.catalog_name if self.py_catalog_class_module is None else None
             ),
+            catalog_credential_provider=self._catalog_credential_provider(),
         )
 
         # The provider is taken as `scan_parquet` does, untyped.
@@ -2092,7 +2115,14 @@ class IcebergSinkState:
             replace_files=hand_back,
         )
         state.sink_uuid_str = self.sink_uuid_str
-        rows = _scan_iceberg_files(table, tasks, self.iceberg_storage_properties)
+        provider = self._catalog_credential_provider()
+        state.catalog_credential_provider_ = NoPickleOption(provider)
+        rows = _scan_iceberg_files(
+            table,
+            tasks,
+            self.iceberg_storage_properties,
+            catalog_credential_provider=provider,
+        )
         state.attach_sink(rows.remove(predicate)).collect()
         assert hand_back.files is not None
         return hand_back.files, hand_back.sort_order_id
