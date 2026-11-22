@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from polars._utils.logging import eprint, verbose
@@ -12,9 +13,35 @@ if TYPE_CHECKING:
 
     import pyiceberg.catalog
 
+    from polars.io.cloud.credential_provider._providers import (
+        CredentialProviderFunction,
+    )
     from polars.io.iceberg._dataset import IcebergCatalogConfig
 
-    IcebergCatalogResolver: TypeAlias = Callable[[str], pyiceberg.catalog.Catalog]
+    IcebergCatalogResolver: TypeAlias = Callable[
+        [str], "pyiceberg.catalog.Catalog | IcebergResolvedCatalog"
+    ]
+
+
+@dataclass(frozen=True)
+class IcebergResolvedCatalog:
+    """
+    A catalog with the credential provider for its tables' data files.
+
+    Not public API: a resolver may return this instead of a bare catalog. Scans and
+    sinks of tables loaded through the catalog's name then read and write data files
+    with `credential_provider`, rather than with credentials from the table's FileIO
+    properties. Storage options with credentials passed to the scan or sink still
+    take precedence.
+
+    The provider is used as given: the table's region and endpoint storage options
+    are not bound onto it. It is pickled into the plans of scans and sinks, so the
+    resolver must give one that is free of secrets when pickled.
+    """
+
+    catalog: pyiceberg.catalog.Catalog
+    credential_provider: CredentialProviderFunction | None = None
+
 
 # `None` is the default resolver, `pyiceberg.catalog.load_catalog(name)`.
 ICEBERG_CATALOG_RESOLVER: IcebergCatalogResolver | None = None
@@ -24,7 +51,9 @@ def set_iceberg_catalog_resolver(resolver: IcebergCatalogResolver | None) -> Non
     """
     Set the function that turns an Iceberg catalog name into a catalog.
 
-    Not public API: Polars Cloud installs one on its workers.
+    Not public API: Polars Cloud installs one on its workers. The resolver returns
+    a PyIceberg catalog, or an `IcebergResolvedCatalog` to also give the credential
+    provider for the data files of the catalog's tables.
 
     A catalog name is resolved with the resolver set in the process that loads
     the table, which may be another process than the one that built the plan.
@@ -53,10 +82,16 @@ def check_catalog_name(name: str) -> str:
 
 def resolve_catalog(name: str) -> pyiceberg.catalog.Catalog:
     """Turn a catalog name into a PyIceberg catalog, with the current resolver."""
+    return resolve_catalog_with_credential_provider(name).catalog
+
+
+def resolve_catalog_with_credential_provider(name: str) -> IcebergResolvedCatalog:
+    """As `resolve_catalog`, with the resolver's credential provider, if any."""
     import pyiceberg.catalog
     from pyiceberg.catalog.noop import NoopCatalog
 
     resolver = ICEBERG_CATALOG_RESOLVER
+    credential_provider: CredentialProviderFunction | None = None
 
     if verbose():
         eprint(
@@ -78,12 +113,18 @@ def resolve_catalog(name: str) -> pyiceberg.catalog.Catalog:
         # An installed resolver's errors are meant for the user as written; the
         # note says where they come from, as they may surface far from the scan.
         try:
-            catalog = resolver(name)
+            resolved = resolver(name)
         except Exception as error:
             error.add_note(
                 f"raised by the Iceberg catalog resolver for catalog {name!r}"
             )
             raise
+
+        if isinstance(resolved, IcebergResolvedCatalog):
+            catalog = resolved.catalog
+            credential_provider = resolved.credential_provider
+        else:
+            catalog = resolved
 
     if not isinstance(catalog, pyiceberg.catalog.Catalog):
         msg = (
@@ -98,7 +139,7 @@ def resolve_catalog(name: str) -> pyiceberg.catalog.Catalog:
         )
         raise TypeError(msg)
 
-    return catalog
+    return IcebergResolvedCatalog(catalog, credential_provider)
 
 
 def catalog_from(config: IcebergCatalogConfig | str) -> pyiceberg.catalog.Catalog:

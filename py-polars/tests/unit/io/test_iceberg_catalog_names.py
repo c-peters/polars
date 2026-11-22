@@ -22,8 +22,10 @@ from pyiceberg.catalog.sql import SqlCatalog
 
 from polars.io.iceberg import _catalog_resolver
 from polars.io.iceberg._catalog_resolver import (
+    IcebergResolvedCatalog,
     check_catalog_name,
     resolve_catalog,
+    resolve_catalog_with_credential_provider,
     set_iceberg_catalog_resolver,
 )
 from polars.io.iceberg._sink import IcebergSinkState
@@ -444,3 +446,306 @@ def test_sink_state_resolves_again_after_pickling(sales: SqlCatalog) -> None:
     assert excinfo.value.__notes__ == [
         "raised by the Iceberg catalog resolver for catalog 'sales'"
     ]
+
+
+def test_resolver_may_return_a_credential_provider(sales: SqlCatalog) -> None:
+    def provider() -> tuple[dict[str, str], int | None]:
+        return {}, None
+
+    set_iceberg_catalog_resolver(
+        lambda _: IcebergResolvedCatalog(sales, credential_provider=provider)
+    )
+
+    assert resolve_catalog("sales") is sales
+    assert resolve_catalog_with_credential_provider("sales") == (
+        IcebergResolvedCatalog(sales, provider)
+    )
+
+    set_iceberg_catalog_resolver(lambda _: sales)
+    assert resolve_catalog_with_credential_provider("sales") == (
+        IcebergResolvedCatalog(sales, None)
+    )
+
+
+@pytest.fixture
+def vended_sales(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SqlCatalog:
+    """A catalog whose empty table `ns.t` is on S3, with vended credentials."""
+    path = tmp_path / "vended"
+    path.mkdir()
+    catalog = SqlCatalog(
+        "sales",
+        uri=f"sqlite:///{path / 'catalog.db'}",
+        warehouse=f"file://{path}",
+        **{
+            "s3.region": "eu-west-1",
+            "s3.access-key-id": "vended-key",
+            "s3.secret-access-key": "vended-secret",
+            "s3.session-token": "vended-token",
+        },
+    )
+    catalog.create_namespace("ns")
+    table = catalog.create_table(
+        ("ns", "t"), schema=pl.Schema({"a": pl.Int64}).to_arrow()
+    )
+    table.metadata_location = "s3://bucket/t/metadata/v1.metadata.json"
+    table.metadata = table.metadata.model_copy(update={"location": "s3://bucket/t"})
+    monkeypatch.setattr(catalog, "load_table", lambda identifier: table)
+    return catalog
+
+
+ROLE_CREDENTIALS = {
+    "aws_access_key_id": "role-key",
+    "aws_secret_access_key": "role-secret",
+    "aws_session_token": "role-token",
+}
+
+
+class RoleCredentialProvider:
+    """Stands in for e.g. `pl.CredentialProviderAWS(assume_role=...)`."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self) -> tuple[dict[str, str], int | None]:
+        self.calls += 1
+        return ROLE_CREDENTIALS, None
+
+
+def native_scan_resolver(storage_options: dict[str, str] | None = None) -> Any:
+    from polars.io.cloud._utils import NoPickleOption
+    from polars.io.iceberg._dataset import (
+        IcebergCatalogTableDescriptor,
+        IcebergScanResolver,
+        IcebergScanTableSerializer,
+        IcebergTableWrap,
+    )
+
+    return IcebergScanResolver(
+        table=IcebergTableWrap(
+            table_=NoPickleOption(None),
+            table_descriptor_=IcebergCatalogTableDescriptor(
+                table_identifier="ns.t", catalog_config="sales"
+            ),
+            serializer=IcebergScanTableSerializer(),
+            iceberg_storage_properties=storage_options,
+        ),
+        snapshot_id=None,
+        from_snapshot_id_exclusive=None,
+        to_snapshot_id_inclusive=None,
+        reader_override=None,
+        use_metadata_statistics=True,
+        fast_deletion_count=False,
+        use_pyiceberg_filter=True,
+    )
+
+
+def lower(resolver: Any) -> Any:
+    from polars.io.iceberg._dataset import _NativeIcebergScanData
+
+    scan_data = resolver._to_dataset_scan_impl()
+    assert isinstance(scan_data, _NativeIcebergScanData)
+    return scan_data
+
+
+def native_scan_data(storage_options: dict[str, str] | None = None) -> Any:
+    return lower(native_scan_resolver(storage_options))
+
+
+@pytest.mark.usefixtures("_pyiceberg_planner")
+def test_scan_without_resolver_credential_provider_uses_vended_credentials(
+    vended_sales: SqlCatalog,
+) -> None:
+    set_iceberg_catalog_resolver(lambda _: vended_sales)
+
+    scan_data = native_scan_data()
+
+    assert scan_data.storage_options == {
+        "aws_region": "eu-west-1",
+        "aws_access_key_id": "vended-key",
+        "aws_secret_access_key": "vended-secret",
+        "aws_session_token": "vended-token",
+    }
+    assert scan_data.credential_provider == "auto"
+
+
+@pytest.mark.usefixtures("_pyiceberg_planner")
+def test_scan_uses_resolver_credential_provider(vended_sales: SqlCatalog) -> None:
+    from polars.io.cloud.credential_provider._builder import (
+        CredentialProviderBuilder,
+    )
+
+    provider = RoleCredentialProvider()
+    set_iceberg_catalog_resolver(
+        lambda _: IcebergResolvedCatalog(vended_sales, credential_provider=provider)
+    )
+
+    scan_data = native_scan_data()
+
+    # The catalog's credentials are dropped, its other options kept.
+    assert scan_data.storage_options == {"aws_region": "eu-west-1"}
+    builder = scan_data.credential_provider
+    assert isinstance(builder, CredentialProviderBuilder)
+    assert builder.build_credential_provider()() == (ROLE_CREDENTIALS, None)  # type: ignore[misc]
+    assert provider.calls == 1
+
+    # Carried as a provider, never as fixed credentials.
+    pickled = pickle.dumps(builder)
+    assert b"vended-key" not in pickled
+    assert b"role-key" not in pickled
+
+
+@pytest.mark.usefixtures("_pyiceberg_planner")
+def test_scan_reresolves_credential_provider_after_unpickle(
+    vended_sales: SqlCatalog,
+) -> None:
+    first = RoleCredentialProvider()
+    set_iceberg_catalog_resolver(
+        lambda _: IcebergResolvedCatalog(vended_sales, credential_provider=first)
+    )
+    resolver = native_scan_resolver()
+    lower(resolver).credential_provider.build_credential_provider()()
+    assert first.calls == 1
+
+    pickled = pickle.dumps(resolver)
+    assert b"RoleCredentialProvider" not in pickled
+
+    second = RoleCredentialProvider()
+    set_iceberg_catalog_resolver(
+        lambda _: IcebergResolvedCatalog(vended_sales, credential_provider=second)
+    )
+    scan_data = lower(pickle.loads(pickled))
+    scan_data.credential_provider.build_credential_provider()()
+    assert (first.calls, second.calls) == (1, 1)
+
+
+@pytest.mark.usefixtures("_pyiceberg_planner")
+def test_scan_user_credentials_win_over_resolver_credential_provider(
+    vended_sales: SqlCatalog,
+) -> None:
+    provider = RoleCredentialProvider()
+    set_iceberg_catalog_resolver(
+        lambda _: IcebergResolvedCatalog(vended_sales, credential_provider=provider)
+    )
+
+    scan_data = native_scan_data(
+        {"s3.access-key-id": "user-key", "s3.secret-access-key": "user-secret"}
+    )
+
+    assert scan_data.storage_options == {
+        "aws_region": "eu-west-1",
+        "aws_access_key_id": "user-key",
+        "aws_secret_access_key": "user-secret",
+    }
+    assert scan_data.credential_provider == "auto"
+    assert provider.calls == 0
+
+
+class _SinkArgs(Exception):
+    pass
+
+
+def sink_parquet_kwargs(
+    monkeypatch: pytest.MonkeyPatch, storage_options: dict[str, str] | None = None
+) -> dict[str, Any]:
+    """Keyword arguments a sink to `sales` passes to `sink_parquet`."""
+
+    def capture(self: pl.LazyFrame, *args: Any, **kwargs: Any) -> Any:
+        raise _SinkArgs(kwargs)
+
+    monkeypatch.setattr(pl.LazyFrame, "sink_parquet", capture)
+    with pytest.raises(_SinkArgs) as e:
+        pl.LazyFrame({"a": [1]}).sink_iceberg(
+            "ns.t", mode="append", catalog="sales", storage_options=storage_options
+        )
+    kwargs: dict[str, Any] = e.value.args[0]
+    return kwargs
+
+
+@pytest.mark.usefixtures("_pyiceberg_planner")
+def test_sink_uses_resolver_credential_provider(
+    vended_sales: SqlCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = RoleCredentialProvider()
+    set_iceberg_catalog_resolver(
+        lambda _: IcebergResolvedCatalog(vended_sales, credential_provider=provider)
+    )
+
+    kwargs = sink_parquet_kwargs(monkeypatch)
+
+    assert kwargs["storage_options"] == {"aws_region": "eu-west-1"}
+    built = kwargs["credential_provider"].build_credential_provider()
+    assert built() == (ROLE_CREDENTIALS, None)
+    assert provider.calls == 1
+
+    # The user's credentials win.
+    kwargs = sink_parquet_kwargs(
+        monkeypatch,
+        {"s3.access-key-id": "user-key", "s3.secret-access-key": "user-secret"},
+    )
+    assert kwargs["storage_options"] == {
+        "aws_region": "eu-west-1",
+        "aws_access_key_id": "user-key",
+        "aws_secret_access_key": "user-secret",
+    }
+    assert kwargs["credential_provider"] == "auto"
+
+
+@pytest.mark.usefixtures("_pyiceberg_planner")
+def test_sink_state_does_not_pickle_resolver_credential_provider(
+    vended_sales: SqlCatalog,
+) -> None:
+    provider = RoleCredentialProvider()
+    set_iceberg_catalog_resolver(
+        lambda _: IcebergResolvedCatalog(vended_sales, credential_provider=provider)
+    )
+    state = IcebergSinkState.new("ns.t", mode="append", catalog="sales")
+    assert state._catalog_credential_provider() is provider
+
+    # Resolved again where the state is unpickled, e.g. for the commit.
+    other = RoleCredentialProvider()
+    set_iceberg_catalog_resolver(
+        lambda _: IcebergResolvedCatalog(vended_sales, credential_provider=other)
+    )
+    assert pickle.loads(pickle.dumps(state))._catalog_credential_provider() is other
+
+
+@pytest.mark.usefixtures("_pyiceberg_planner")
+def test_overwrite_survivors_use_resolver_credential_provider(
+    sales: SqlCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from polars.io.iceberg import _credentials
+
+    provider = RoleCredentialProvider()
+    set_iceberg_catalog_resolver(
+        lambda _: IcebergResolvedCatalog(sales, credential_provider=provider)
+    )
+
+    in_commit = False
+    commit_providers: list[Any] = []
+    renewing = _credentials.renewing_credential_provider
+    commit = IcebergSinkState.commit
+
+    def spy_renewing(*args: Any, **kwargs: Any) -> Any:
+        if in_commit:
+            commit_providers.append(kwargs.get("catalog_credential_provider"))
+        return renewing(*args, **kwargs)
+
+    def spy_commit(*args: Any) -> Any:
+        nonlocal in_commit
+        in_commit = True
+        try:
+            return commit(*args)
+        finally:
+            in_commit = False
+
+    monkeypatch.setattr(_credentials, "renewing_credential_provider", spy_renewing)
+    monkeypatch.setattr(IcebergSinkState, "commit", spy_commit)
+
+    pl.LazyFrame({"a": [9]}).sink_iceberg(
+        "ns.t", catalog="sales", mode="overwrite", overwrite_filter=pl.col("a") == 1
+    )
+
+    # The scan matching the file's rows, the scan of its surviving rows and their
+    # sink.
+    assert commit_providers == [provider, provider, provider]
+    assert table_rows(sales)["a"].to_list() == [2, 9]

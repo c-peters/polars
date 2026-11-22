@@ -53,6 +53,9 @@ pub struct IcebergSinkState {
 
     #[cfg(feature = "python")]
     pub replace_files: Option<PythonObject>, // _ReplaceFiles: the data files a commit replaces
+
+    #[cfg(feature = "python")]
+    pub catalog_credential_provider_: Option<PythonObject>, // NoPickleOption[CredentialProviderFunction]
 }
 
 #[derive(Copy, Clone, PartialEq, Debug, Eq, Hash)]

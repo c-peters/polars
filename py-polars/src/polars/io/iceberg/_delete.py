@@ -16,6 +16,9 @@ if TYPE_CHECKING:
 
     from polars._typing import PolarsDataType, StorageOptionsDict
     from polars.expr import Expr
+    from polars.io.cloud.credential_provider._providers import (
+        CredentialProviderFunction,
+    )
     from polars.io.iceberg._sink import _ReplaceFiles
     from polars.lazyframe import LazyFrame
 
@@ -177,6 +180,8 @@ def _matching_files(
     tasks: list[FileScanTask],
     predicate: Expr,
     storage_options: StorageOptionsDict | None,
+    *,
+    catalog_credential_provider: CredentialProviderFunction | None = None,
 ) -> tuple[list[FileScanTask], list[FileScanTask]]:
     """Of `tasks`, the files whose live rows all match `predicate`, and those with some.
 
@@ -187,9 +192,12 @@ def _matching_files(
     from polars.io.iceberg.functions import _scan_iceberg_files
 
     counts = collect_all(
-        _scan_iceberg_files(table, [task], storage_options).select(
-            matched=predicate.fill_null(False).sum(), total=count()
-        )
+        _scan_iceberg_files(
+            table,
+            [task],
+            storage_options,
+            catalog_credential_provider=catalog_credential_provider,
+        ).select(matched=predicate.fill_null(False).sum(), total=count())
         for task in tasks
     )
     whole, partial = [], []
